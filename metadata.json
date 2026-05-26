@@ -1,0 +1,6 @@
+{
+  "name": "E-M Translator & Vocab Reader",
+  "description": "Translate English sentences to Myanmar and automatically analyze words, retrieving definitions from an uploaded English-Myanmar dictionary file while skipping prepositions, pronouns, and articles.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
