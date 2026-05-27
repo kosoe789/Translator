@@ -16,7 +16,10 @@ import {
   ArrowRight,
   Image as ImageIcon,
   X,
-  History
+  History,
+  Lock,
+  Unlock,
+  Star
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { DictionaryEntry, WorkspaceFile, AnalyzedWord, HistoryItem } from "./types";
@@ -179,8 +182,23 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResult, setSearchResult] = useState<string | null>(null);
 
-  // History / Logs
-  const [history, setHistory] = useState<HistoryItem[]>([]);
+  // History / Logs with local persistence
+  const [history, setHistory] = useState<HistoryItem[]>(() => {
+    try {
+      const saved = localStorage.getItem("em_translator_history");
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("em_translator_history", JSON.stringify(history));
+    } catch (err) {
+      console.error("Failed to save history to localStorage:", err);
+    }
+  }, [history]);
 
   // UI helper alerts
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -190,6 +208,11 @@ export default function App() {
   
   // Drag and drop state
   const [isDragging, setIsDragging] = useState(false);
+
+  // Admin upload states for Server dictionary files
+  const [passcode, setPasscode] = useState("");
+  const [isUploadingToServer, setIsUploadingToServer] = useState(false);
+  const [isDeletingFromServer, setIsDeletingFromServer] = useState<string | null>(null);
   
   // Parser debug info
   const [parserDebugInfo, setParserDebugInfo] = useState<{
@@ -200,6 +223,7 @@ export default function App() {
 
   // Ref for copy-to-clipboard trick
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const serverFileInputRef = useRef<HTMLInputElement>(null);
 
   // States for Image Translator
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
@@ -604,6 +628,95 @@ export default function App() {
     e.target.value = "";
   };
 
+  // Upload file securely to Node server workspace
+  const handleServerFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (!file.name.endsWith(".txt")) {
+      showError("ကျေးဇူးပြု၍ .txt file အမျိုးအစားကိုသာ တင်ပေးပါ။");
+      e.target.value = "";
+      return;
+    }
+
+    if (!passcode.trim()) {
+      showError("ဆာဗာသို့ တင်ရန် လျှို့ဝှက်နံပါတ် (Passcode) ကို အရင်ဆုံး ညာဘက် panel အောက်တွင် ထည့်သွင်းပေးပါ။");
+      e.target.value = "";
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      const text = event.target?.result;
+      if (typeof text === "string") {
+        setIsUploadingToServer(true);
+        try {
+          const res = await fetch("/api/upload-dictionary", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              filename: file.name,
+              content: text,
+              passcode: passcode.trim(),
+            }),
+          });
+          const data = await res.json();
+          if (!res.ok) {
+            throw new Error(data.error || "ဖိုင်တင်ရန် မအောင်မြင်ပါ။");
+          }
+          showSuccess(`ဖိုင် '${file.name}' ကို ဆာဗာသို့ အောင်မြင်စွာ တင်ပြီးပါပြီ။`);
+          // Automatically run local parser for instant cache load
+          processDictionaryText(text, file.name);
+          // Refresh lists
+          scanServerFiles();
+        } catch (err: any) {
+          showError(`ဆာဗာသို့တင်ရန် မအောင်မြင်ပါ: ${err.message}`);
+        } finally {
+          setIsUploadingToServer(false);
+        }
+      }
+    };
+    reader.onerror = () => {
+      showError("ဖိုင်ဖတ်ရှုနေစဉ် အမှားအယွင်း ဖြစ်ပေါ်ခဲ့ပါသည်။");
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  // Delete file securely from server workspace directory
+  const handleServerFileDelete = async (filename: string) => {
+    if (!passcode.trim()) {
+      showError("ဆာဗာမှ ဖျက်ရန် လျှို့ဝှက်နံပါတ် (Passcode) ကို ညာဘက် panel အောက်တွင် အရင်ဆုံး ထည့်သွင်းပေးပါ။");
+      return;
+    }
+
+    if (!confirm(`ဆာဗာပေါ်ရှိ '${filename}' ဖိုင်ကို အပြီးသတ် ဖျက်ပစ်ရန် သေချာပါသလား?`)) {
+      return;
+    }
+
+    setIsDeletingFromServer(filename);
+    try {
+      const res = await fetch("/api/delete-dictionary", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          filename,
+          passcode: passcode.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "ဖိုင်ဖျက်ရန် မအောင်မြင်ပါ။");
+      }
+      showSuccess(`ဖိုင် '${filename}' ကို ဆာဗာမှ အောင်မြင်စွာ ဖျက်ဆီးပြီးပါပြီ။`);
+      scanServerFiles();
+    } catch (err: any) {
+      showError(`ဆာဗာဖိုင်ဖျက်ရန် မအောင်မြင်ပါ: ${err.message}`);
+    } finally {
+      setIsDeletingFromServer(null);
+    }
+  };
+
   // Drag over dropzone
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
@@ -756,15 +869,40 @@ export default function App() {
       setSelectedWordIndex(0);
       setActiveRightTab("vocab");
 
-      // Add to history list
+      // Add to history list with bookmark preservation and duplicate filtering
       const newItem: HistoryItem = {
         id: Date.now().toString(),
-        originalText: data.extractedText || inputText,
+        originalText: (data.extractedText || inputText).trim(),
         translation: data.translation,
         timestamp: Date.now(),
+        isBookmarked: false,
         words: analyzedWordsWithLookups,
       };
-      setHistory((prev) => [newItem, ...prev.slice(0, 9)]);
+
+      setHistory((prev) => {
+        // Prevent duplicate items. If the item already exists, preserve its isBookmarked status.
+        const existing = prev.find(
+          (item) => item.originalText.toLowerCase() === newItem.originalText.toLowerCase()
+        );
+        const filtered = prev.filter(
+          (item) => item.originalText.toLowerCase() !== newItem.originalText.toLowerCase()
+        );
+        
+        const itemToInsert = existing 
+          ? { ...newItem, isBookmarked: existing.isBookmarked } 
+          : newItem;
+
+        const merged = [itemToInsert, ...filtered];
+        
+        // If history list becomes very large (e.g. > 50), prune excess items that are NOT bookmarked
+        if (merged.length > 50) {
+          const bookmarkedList = merged.filter((item) => item.isBookmarked);
+          const nonBookmarkedList = merged.filter((item) => !item.isBookmarked);
+          // Keep up to 30 recent non-bookmarked items
+          return [...bookmarkedList, ...nonBookmarkedList.slice(0, 30)];
+        }
+        return merged;
+      });
       showSuccess("ဘာသာပြန်ဆိုပြီး ဝါစင်္ဂများကို တိုက်ဆိုင်ရှာဖွေပြီးပါပြီ။");
     } catch (err: any) {
       console.error(err);
@@ -814,6 +952,18 @@ export default function App() {
     <div className="min-h-screen bg-[#F8FAFC]">
       <main className="max-w-6xl mx-auto px-4 py-8">
         
+        {/* International-Standard Premium Header Banner */}
+        <div className="mb-8 relative overflow-hidden rounded-2xl border border-slate-900/10 bg-gradient-to-r from-slate-900 via-indigo-950 to-slate-900 shadow-xl py-8 px-8 flex items-center justify-center text-center">
+          {/* Stunning subtle glowing orb effects for high productivity feel */}
+          <div className="absolute top-1/2 left-1/4 -translate-y-1/2 w-80 h-32 bg-cyan-500/10 rounded-full blur-3xl pointer-events-none animate-pulse" style={{ animationDuration: '4s' }} />
+          <div className="absolute top-1/2 right-1/4 -translate-y-1/2 w-80 h-32 bg-violet-600/15 rounded-full blur-3xl pointer-events-none animate-pulse" style={{ animationDuration: '6s' }} />
+          <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.03),transparent)] pointer-events-none" />
+          
+          <h1 className="relative text-2xl sm:text-3.5xl font-extrabold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-white via-indigo-100 to-indigo-50 drop-shadow-sm">
+            English to Myanmar Translator and Definitions
+          </h1>
+        </div>
+
         {/* Dynamic Alerts */}
         <AnimatePresence>
           {successMessage && (
@@ -1294,47 +1444,121 @@ export default function App() {
                       <div className="border-b border-slate-100 pb-2.5">
                         <h3 className="text-xs font-bold uppercase tracking-wider text-slate-750 flex items-center gap-1.5">
                           <Upload className="w-4 h-4 text-indigo-500" />
-                          Dictionary ဖိုင်တင်ရန် (Manage Database)
+                          Dictionary စီမံခန့်ခွဲမှု (Manage Database)
                         </h3>
                         <p className="text-[10px] text-slate-450 mt-0.5">
-                          စကားလုံး ဖွင့်ဆိုချက်များပါဝင်သော TXT ဖိုင်များ တင်သွင်းရန်
+                          စကားလုံးဖွင့်ဆိုချက်များပါရှိသော .txt ဖိုင်များကို တင်သွင်းရန်နှင့် စီမံရန်
                         </p>
                       </div>
 
-                      {/* Drag & Drop */}
-                      <div
-                        onDragOver={handleDragOver}
-                        onDragLeave={handleDragLeave}
-                        onDrop={handleDrop}
-                        onClick={() => fileInputRef.current?.click()}
-                        className={`border-2 border-dashed rounded-xl p-4.5 text-center cursor-pointer transition-all ${
-                          isDragging 
-                            ? "border-indigo-500 bg-indigo-50/45 text-indigo-700" 
-                            : "border-slate-200 hover:border-slate-300 hover:bg-slate-50 text-slate-605"
-                        }`}
-                      >
+                      {/* Securing Block: Passcode Verification Input */}
+                      <div className="bg-slate-50 border border-slate-200/80 p-3 rounded-xl space-y-2">
+                        <div className="flex items-center justify-between">
+                          <label className="text-[10px] font-bold text-slate-700 uppercase tracking-wide flex items-center gap-1">
+                            {passcode.trim() ? (
+                              <Unlock className="w-3.5 h-3.5 text-emerald-600 animate-pulse" />
+                            ) : (
+                              <Lock className="w-3.5 h-3.5 text-indigo-600" />
+                            )}
+                            ပိုင်ရှင်ဖြစ်ကြောင်း အတည်ပြုရန် လျှို့ဝှက်နံပါတ် (Passcode)
+                          </label>
+                        </div>
+                        <div className="relative">
+                          <input
+                            type="password"
+                            value={passcode}
+                            onChange={(e) => setPasscode(e.target.value)}
+                            placeholder="ဆာဗာသို့ တင်ရန် / လှမ်းဖျက်ရန် Passcode ရိုက်ထည့်ပါ..."
+                            className="w-full text-xs bg-white border border-slate-200 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100 rounded-lg py-1.5 pl-8 pr-3 transition-all font-mono placeholder:text-slate-400 placeholder:font-sans text-slate-755"
+                          />
+                          <div className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400">
+                            <Lock className="w-3.5 h-3.5" />
+                          </div>
+                        </div>
+                        <p className="text-[9px] text-slate-400 leading-relaxed">
+                          * <span className="font-semibold text-slate-500">Local Browser စနစ်ကို လူတိုင်းသုံးနိုင်သည်</span>။ သို့သော် ဆာဗာသို့ အပြီးသတ်တင်သွင်းရန်နှင့် ဆာဗာရှိ file များကို ဖျက်ရန်အတွက်မူ ပိုင်ရှင်သီးသန့် လျှို့ဝှက်နံပါတ် လိုအပ်ပါသည်။
+                        </p>
+                      </div>
+
+                      {/* Mode 1: Local Session for normal visitors */}
+                      <div className="space-y-1.5">
+                        <h4 className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">
+                          ၁။ မိမိစက်မှဖိုင်ကို Browser တွင် ခေတ္တတင်ရန် (Local Browser Mode)
+                        </h4>
+                        <div
+                          onDragOver={handleDragOver}
+                          onDragLeave={handleDragLeave}
+                          onDrop={handleDrop}
+                          onClick={() => fileInputRef.current?.click()}
+                          className={`border-2 border-dashed rounded-xl p-3.5 text-center cursor-pointer transition-all ${
+                            isDragging 
+                              ? "border-indigo-500 bg-indigo-50/45 text-indigo-700" 
+                              : "border-slate-200 hover:border-slate-300 hover:bg-slate-50 text-slate-605"
+                          }`}
+                        >
+                          <input
+                            type="file"
+                            ref={fileInputRef}
+                            onChange={handleLocalFileUpload}
+                            accept=".txt"
+                            className="hidden"
+                          />
+                          <Upload className="w-5 h-5 mx-auto text-slate-400 mb-1" />
+                          <p className="text-[11px] font-bold text-slate-700">
+                            {isDragging ? "ဤနေရာသို့ လွှတ်ချလိုက်ပါ" : "ဖိုင်ဆွဲထည့်ပါ သို့မဟုတ် ဤနေရာကို နှိပ်ပါ"}
+                          </p>
+                          <p className="text-[9px] text-slate-400 mt-0.5">
+                            ဖိုင်ရွေးပြီးပါက ဤ Browser ၏ Local Session တွင် ချက်ချင်းသိမ်းဆည်းပါမည်
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Mode 2: Server Admin mode (Upload directly to code root directory) */}
+                      <div className="bg-indigo-50/40 border border-indigo-100/60 p-3 rounded-xl space-y-2">
+                        <h4 className="text-[10px] font-bold text-indigo-950 uppercase tracking-wider flex items-center gap-1">
+                          <Sparkles className="w-3.5 h-3.5 text-indigo-500" />
+                          ၂။ ဆာဗာပေါ်သို့ အမြဲတမ်း သိမ်းဆည်းရန် တင်သွင်းမည် (Server Upload)
+                        </h4>
+                        
                         <input
                           type="file"
-                          ref={fileInputRef}
-                          onChange={handleLocalFileUpload}
+                          ref={serverFileInputRef}
+                          onChange={handleServerFileUpload}
                           accept=".txt"
                           className="hidden"
                         />
                         
-                        <Upload className="w-5 h-5 mx-auto text-indigo-500 mb-1.5" />
-                        <p className="text-xs font-bold">
-                          {isDragging ? "ဤနေရာသို့ လွှတ်ချလိုက်ပါ" : "နှိပ်၍ တင်ပါ သို့မဟုတ် ဖိုင်ဆွဲထည့်ပါ"}
-                        </p>
-                        <p className="text-[9px] text-slate-400 mt-0.5">
-                          TXT dictionary lines (Max 15MB)
-                        </p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (!passcode.trim()) {
+                              showError("ဆာဗာသို့ တင်သွင်းရန် အပေါ်ရှိ Passcode လျှို့ဝှက်ချက်ကို အရင်ဆုံး ဖြည့်စွက်ပေးပါ။");
+                              return;
+                            }
+                            serverFileInputRef.current?.click();
+                          }}
+                          disabled={isUploadingToServer}
+                          className="w-full text-xs font-bold bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 text-white py-2 px-3 rounded-lg flex items-center justify-center gap-1.5 shadow-sm transition-all cursor-pointer"
+                        >
+                          {isUploadingToServer ? (
+                            <>
+                              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                              <span>ဆာဗာသို့ တင်ပို့နေသည်...</span>
+                            </>
+                          ) : (
+                            <>
+                              <FileText className="w-3.5 h-3.5" />
+                              <span>ဆာဗာပေါ်သို့ အပြီးသတ်တင်မည်</span>
+                            </>
+                          )}
+                        </button>
                       </div>
 
-                      {/* Server files load */}
+                      {/* Server files load and delete list */}
                       <div className="space-y-2">
                         <div className="flex items-center justify-between">
                           <h4 className="text-[10px] font-bold text-slate-500 uppercase tracking-wider flex items-center gap-1">
-                            <FileText className="w-3.5 h-3.5" />
+                            <FileText className="w-3.5 h-3.5 text-indigo-550" />
                             Server Dictionary ဖိုင်များ
                           </h4>
                           <button
@@ -1359,13 +1583,29 @@ export default function App() {
                                     {(srv.size / 1024).toFixed(1)} KB
                                   </p>
                                 </div>
-                                <button
-                                  onClick={() => handleLoadServerFile(srv.filename)}
-                                  disabled={isLoadingServerFile !== null}
-                                  className="text-[10px] bg-white hover:bg-indigo-50 hover:text-indigo-600 border border-slate-205 px-2 py-0.5 rounded font-bold transition-all shrink-0 cursor-pointer disabled:opacity-50"
-                                >
-                                  {isLoadingServerFile === srv.filename ? "..." : "Load"}
-                                </button>
+                                <div className="flex items-center gap-1">
+                                  <button
+                                    onClick={() => handleLoadServerFile(srv.filename)}
+                                    disabled={isLoadingServerFile !== null}
+                                    className="text-[10px] bg-white hover:bg-indigo-50 hover:text-indigo-600 border border-slate-205 px-2.5 py-1 rounded font-bold transition-all cursor-pointer disabled:opacity-50"
+                                    title="ဤ database ဖိုင်ကို system တွင် select လုပ်၍ parse လုပ်ပါ"
+                                  >
+                                    {isLoadingServerFile === srv.filename ? "..." : "Load"}
+                                  </button>
+                                  
+                                  <button
+                                    onClick={() => handleServerFileDelete(srv.filename)}
+                                    disabled={isDeletingFromServer !== null}
+                                    className="p-1 rounded text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-all cursor-pointer"
+                                    title="ဆာဗာပေါ်မှ အပြီးတိုင် ဖျက်ဆီးပစ်မည်"
+                                  >
+                                    {isDeletingFromServer === srv.filename ? (
+                                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                    ) : (
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    )}
+                                  </button>
+                                </div>
                               </div>
                             ))}
                           </div>
@@ -1381,11 +1621,13 @@ export default function App() {
                       {/* Debug parse info */}
                       {parserDebugInfo && (
                         <div className="bg-slate-50 p-3 rounded-lg border border-slate-100 text-[10px] text-slate-500 space-y-1">
-                          <div className="font-bold text-slate-600 text-[9px] uppercase tracking-wider">
-                            📜 Current Load Info:
+                          <div className="font-bold text-slate-600 text-[9px] uppercase tracking-wider flex items-center gap-1">
+                            <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-ping" />
+                            <span>📜 လက်ရှိ Active ဖြစ်နေသော Data Info:</span>
                           </div>
-                          <div>• lines: <b>{parserDebugInfo.totalLines.toLocaleString()}</b></div>
-                          <div>• index count: <b className="text-emerald-600">{parserDebugInfo.parsedCount.toLocaleString()} words</b></div>
+                          <div>• ဖိုင်အမည်: <span className="font-bold text-slate-700">{loadedFileName || "မသိရှိရပါ"}</span></div>
+                          <div>• စာကြောင်းစုစုပေါင်း: <b>{parserDebugInfo.totalLines.toLocaleString()} ကြောင်း</b></div>
+                          <div>• အောင်မြင်စွာဖတ်ပြီးသော စကားလုံးအရေအတွက်: <b className="text-emerald-600">{parserDebugInfo.parsedCount.toLocaleString()} လုံး</b></div>
                         </div>
                       )}
                     </motion.div>
@@ -1402,18 +1644,27 @@ export default function App() {
                     >
                       <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
                         <div>
-                          <h3 className="text-xs font-bold uppercase tracking-wider text-slate-750 flex items-center gap-1.5">
+                          <h3 className="text-xs font-bold uppercase tracking-wider text-slate-755 flex items-center gap-1.5">
                             <History className="w-4 h-4 text-slate-500" />
                             ယခင်ရှာဖွေမှုမှတ်တမ်း (Recent)
                           </h3>
                           <p className="text-[10px] text-slate-450 mt-0.5">
-                            ယခင်ဘာသာပြန်ပြီးရှာဖွေခဲ့သမျှ စာရင်းဇယားမှတ်တမ်း
+                            ရှာဖွေခဲ့သမျှ စာရင်းဇယားမှတ်တမ်း (Bookmark များ မပျက်ပါ)
                           </p>
                         </div>
                         {history.length > 0 && (
                           <button
-                            onClick={() => setHistory([])}
-                            className="text-[9px] text-rose-600 hover:text-rose-700 bg-rose-50 hover:bg-rose-100 px-1.5 py-0.5 rounded transition-all font-bold cursor-pointer"
+                            onClick={() => {
+                              const bookmarkedOnly = history.filter(item => item.isBookmarked);
+                              setHistory(bookmarkedOnly);
+                              if (bookmarkedOnly.length < history.length) {
+                                showSuccess("သမိုင်းမှတ်တမ်းကို ရှင်းလင်းလိုက်ပါပြီ။ Bookmark ပြုလုပ်ထားသော အရာများသာ ချန်လှပ်ထားပါသည်။");
+                              } else {
+                                showSuccess("ဖျက်ရန် သမိုင်းမှတ်တမ်းအသစ် မရှိသေးပါ။");
+                              }
+                            }}
+                            className="text-[9px] text-rose-600 hover:text-rose-700 bg-rose-50 hover:bg-rose-100 px-2 py-0.5 rounded transition-all font-bold cursor-pointer"
+                            title="Bookmark ပြုလုပ်ထားသော အရာများကို ချန်လှပ်၍ ကျန်ရှိသမျှကို ရှင်းလင်းပါမည်"
                           >
                             ရှင်းလင်းရန်
                           </button>
@@ -1425,7 +1676,7 @@ export default function App() {
                           {history.map((hist) => (
                             <div 
                               key={hist.id} 
-                              className="pt-2.5 first:pt-0 cursor-pointer group"
+                              className="pt-2.5 first:pt-0 pb-1.5 flex items-start justify-between gap-2 border-b border-dashed border-slate-100 last:border-0 group cursor-pointer"
                               onClick={() => {
                                 setInputText(hist.originalText);
                                 setTranslationResult({
@@ -1436,15 +1687,64 @@ export default function App() {
                                 setActiveRightTab("vocab");
                               }}
                             >
-                              <p className="text-xs font-semibold text-slate-755 group-hover:text-indigo-600 truncate">
-                                {hist.originalText}
-                              </p>
-                              <p className="text-xs text-emerald-600 truncate mt-0.5 font-medium">
-                                {hist.translation}
-                              </p>
-                              <p className="text-[9px] text-slate-400 font-mono mt-0.5">
-                                {new Date(hist.timestamp).toLocaleTimeString()}
-                              </p>
+                              <div className="min-w-0 flex-1 space-y-0.5">
+                                <div className="flex items-center gap-1.5 min-w-0">
+                                  {hist.isBookmarked && (
+                                    <Star className="w-3.5 h-3.5 fill-amber-400 stroke-amber-400 shrink-0" />
+                                  )}
+                                  <p className="text-xs font-semibold text-slate-755 group-hover:text-indigo-600 truncate">
+                                    {hist.originalText}
+                                  </p>
+                                </div>
+                                <p className="text-xs text-emerald-600 truncate font-medium">
+                                  {hist.translation}
+                                </p>
+                                <p className="text-[9px] text-slate-400 font-mono flex items-center gap-1.5">
+                                  <span>{new Date(hist.timestamp).toLocaleTimeString()}</span>
+                                  {hist.isBookmarked && (
+                                    <span className="bg-amber-50 text-amber-600 text-[8px] font-bold px-1 py-0.2 rounded border border-amber-100 uppercase tracking-wide">
+                                      Saved
+                                    </span>
+                                  )}
+                                </p>
+                              </div>
+                              
+                              {/* Row action buttons */}
+                              <div className="flex items-center gap-1 shrink-0 opacity-80 group-hover:opacity-100 transition-opacity">
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setHistory((prev) =>
+                                      prev.map((item) =>
+                                        item.id === hist.id 
+                                          ? { ...item, isBookmarked: !item.isBookmarked } 
+                                          : item
+                                      )
+                                    );
+                                  }}
+                                  className={`p-1 rounded-md transition-colors hover:bg-slate-50 ${
+                                    hist.isBookmarked 
+                                      ? "text-amber-500 hover:text-amber-600" 
+                                      : "text-slate-350 hover:text-amber-500"
+                                  }`}
+                                  title={hist.isBookmarked ? "Bookmark ဖျက်သိမ်းရန်" : "Bookmark မှတ်သားရန် (ရှင်းလင်းသော်လည်း ချန်ထားမည်)"}
+                                >
+                                  <Star className={`w-3.5 h-3.5 ${hist.isBookmarked ? "fill-current" : ""}`} />
+                                </button>
+                                
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setHistory((prev) => prev.filter((item) => item.id !== hist.id));
+                                  }}
+                                  className="p-1 rounded-md text-slate-350 hover:text-rose-600 hover:bg-rose-50 transition-colors"
+                                  title="ဤမှတ်တမ်းကိုဖျက်ရန်"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
                             </div>
                           ))}
                         </div>

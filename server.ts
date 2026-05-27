@@ -188,6 +188,75 @@ Return the output containing:
     }
   });
 
+  // API Route: Securely upload a .txt dictionary file to the workspace
+  app.post("/api/upload-dictionary", (req, res) => {
+    try {
+      const { filename, content, passcode } = req.body;
+      
+      // Determine secret passcode, defaulting to "admin123" if not defined in env
+      const adminPasscode = process.env.ADMIN_UPLOAD_PASSCODE || "admin123";
+      if (!passcode || passcode !== adminPasscode) {
+        res.status(401).json({ error: "လျှို့ဝှက်နံပါတ် (Passcode) မှားယွင်းနေပါသည်။" });
+        return;
+      }
+
+      if (!filename || typeof filename !== "string" || !content || typeof content !== "string") {
+        res.status(400).json({ error: "Filename and content are required." });
+        return;
+      }
+
+      const safeFilename = path.basename(filename);
+      if (!safeFilename.endsWith(".txt") || safeFilename === ".env.example" || safeFilename === "requirements.txt") {
+        res.status(400).json({ error: "Invalid file type. Only .txt files can be uploaded to the server." });
+        return;
+      }
+
+      const filePath = path.join(process.cwd(), safeFilename);
+      fs.writeFileSync(filePath, content, "utf-8");
+      console.log(`Secured upload: ${safeFilename} saved successfully.`);
+      res.json({ success: true, message: "ဖိုင်ကို ဆာဗာသို့ အောင်မြင်စွာ တင်ပြီးပါပြီ။" });
+    } catch (err: any) {
+      console.error("Error securing dictionary upload:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // API Route: Securely delete a .txt dictionary file from the server workspace
+  app.post("/api/delete-dictionary", (req, res) => {
+    try {
+      const { filename, passcode } = req.body;
+      
+      const adminPasscode = process.env.ADMIN_UPLOAD_PASSCODE || "admin123";
+      if (!passcode || passcode !== adminPasscode) {
+        res.status(401).json({ error: "လျှို့ဝှက်နံပါတ် (Passcode) မှားယွင်းနေပါသည်။" });
+        return;
+      }
+
+      if (!filename || typeof filename !== "string") {
+        res.status(400).json({ error: "Filename is required" });
+        return;
+      }
+
+      const safeFilename = path.basename(filename);
+      if (!safeFilename.endsWith(".txt") || safeFilename === ".env.example" || safeFilename === "requirements.txt") {
+        res.status(400).json({ error: "Invalid file type." });
+        return;
+      }
+
+      const filePath = path.join(process.cwd(), safeFilename);
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+        console.log(`Secured delete: ${safeFilename} deleted successfully.`);
+        res.json({ success: true, message: "ဖိုင်ကို ဆာဗာမှ ပယ်ဖျက်လိုက်ပါပြီ။" });
+      } else {
+        res.status(404).json({ error: "File not found" });
+      }
+    } catch (err: any) {
+      console.error("Error securing dictionary deletion:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // API Route: Read the content of a dictionary .txt file from the workspace
   app.get("/api/dictionary-file", (req, res) => {
     try {
