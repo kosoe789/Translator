@@ -13,7 +13,10 @@ import {
   AlertCircle, 
   Sparkles, 
   BookMarked,
-  ArrowRight
+  ArrowRight,
+  Image as ImageIcon,
+  X,
+  History
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { DictionaryEntry, WorkspaceFile, AnalyzedWord, HistoryItem } from "./types";
@@ -159,6 +162,7 @@ export default function App() {
   const [isLoadingServerFile, setIsLoadingServerFile] = useState<string | null>(null);
 
   // States
+  const [selectedWordIndex, setSelectedWordIndex] = useState<number>(0);
   const [isTranslating, setIsTranslating] = useState(false);
   const [translationResult, setTranslationResult] = useState<{
     translation: string;
@@ -196,6 +200,15 @@ export default function App() {
 
   // Ref for copy-to-clipboard trick
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // States for Image Translator
+  const [selectedImage, setSelectedImage] = useState<string | null>(null);
+  const [selectedImageName, setSelectedImageName] = useState("");
+  const [selectedImageMime, setSelectedImageMime] = useState("");
+  const imageInputRef = useRef<HTMLInputElement>(null);
+
+  // Tab State for right-sidebar content
+  const [activeRightTab, setActiveRightTab] = useState<"vocab" | "search" | "dict" | "history">("vocab");
 
   // Initial load: Fetch server dictionary files and check IndexedDB
   useEffect(() => {
@@ -646,22 +659,62 @@ export default function App() {
     }
   };
 
+  const handleImageChange = (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (!file.type.startsWith("image/")) {
+      showError("ကျေးဇူးပြု၍ ပုံဖိုင် (Image) သာ ရွေးချယ်ပေးပါ!");
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      setSelectedImage(reader.result as string);
+      setSelectedImageName(file.name);
+      setSelectedImageMime(file.type);
+      showSuccess("ပုံကို စစ်ဆေးရန် တင်သွင်းပြီးပါပြီ။");
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleRemoveImage = () => {
+    setSelectedImage(null);
+    setSelectedImageName("");
+    setSelectedImageMime("");
+    if (imageInputRef.current) {
+      imageInputRef.current.value = "";
+    }
+  };
+
   // Main Action: Translate Sentence and Match Dictionary
   const handleTranslateAndProcess = async () => {
-    if (!inputText.trim()) {
-      showError("ကျေးဇူးပြု၍ ဘာသာပြန်ရန် အင်္ဂလိပ်စာသား တစ်ခုခု အရင်ထည့်သွင်းပါ!");
+    if (!inputText.trim() && !selectedImage) {
+      showError("ကျေးဇူးပြု၍ ဘာသာပြန်ရန် အင်္ဂလိပ်စာသား တစ်ခုခုထည့်ပါ သို့မဟုတ် ပုံတစ်ပုံ တင်ပေးပါ!");
       return;
     }
 
     setIsTranslating(true);
     setTranslationResult(null);
 
+    let imageBase64 = null;
+    if (selectedImage) {
+      const commaIndex = selectedImage.indexOf(",");
+      if (commaIndex !== -1) {
+        imageBase64 = selectedImage.slice(commaIndex + 1);
+      }
+    }
+
     try {
       // Connect to server api
       const response = await fetch("/api/translate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: inputText }),
+        body: JSON.stringify({ 
+          text: inputText, 
+          image: imageBase64,
+          mimeType: selectedImageMime
+        }),
       });
 
       if (!response.ok) {
@@ -671,6 +724,11 @@ export default function App() {
 
       const data = await response.json();
       
+      // If extractedText is returned and we used an image, update input text so they can see/edit it
+      if (data.extractedText && selectedImage) {
+        setInputText(data.extractedText);
+      }
+
       // Match words in the response with our dictionary map
       const analyzedWordsWithLookups = data.words.map((aw: AnalyzedWord) => {
         // Match base word first
@@ -695,11 +753,13 @@ export default function App() {
       };
 
       setTranslationResult(finalResult);
+      setSelectedWordIndex(0);
+      setActiveRightTab("vocab");
 
       // Add to history list
       const newItem: HistoryItem = {
         id: Date.now().toString(),
-        originalText: inputText,
+        originalText: data.extractedText || inputText,
         translation: data.translation,
         timestamp: Date.now(),
         words: analyzedWordsWithLookups,
@@ -708,7 +768,29 @@ export default function App() {
       showSuccess("ဘာသာပြန်ဆိုပြီး ဝါစင်္ဂများကို တိုက်ဆိုင်ရှာဖွေပြီးပါပြီ။");
     } catch (err: any) {
       console.error(err);
-      showError(`ဘာသာပြန်ဆိုမှု မအောင်မြင်ပါ- ${err.message}`);
+      let friendlyError = err.message || "";
+      if (typeof friendlyError === "object") {
+        friendlyError = JSON.stringify(friendlyError);
+      }
+      
+      if (
+        friendlyError.includes("429") || 
+        friendlyError.toUpperCase().includes("QUOTA") || 
+        friendlyError.toUpperCase().includes("RESOURCE_EXHAUSTED") || 
+        friendlyError.toUpperCase().includes("RATE_LIMIT") || 
+        friendlyError.toLowerCase().includes("exceeded") || 
+        friendlyError.toLowerCase().includes("limit")
+      ) {
+        friendlyError = "Gemini API ၏ တစ်မိနစ်အတွင်း အသုံးပြုမှုအကြိမ်ရေ (Rate Limit / Quota) ကန့်သတ်ချက် ပြည့်သွားသောကြောင့် ဖြစ်ပါသည်။ Google ၏ အခမဲ့ Free Tier စနစ်တွင် တစ်မိနစ်လျှင် အကြိမ်ရေ ၂၀ သာ ခွင့်ပြုထားခြင်းကြောင့် ဖြစ်ပြီး၊ ခေတ္တစက္ကန့် ၃၀ ခန့် စောင့်ဆိုင်းပြီးမှ ပြန်လည်စမ်းသပ်ပေးပါရန် မေတ္တာရပ်ခံအပ်ပါသည်။";
+      } else if (
+        friendlyError.toUpperCase().includes("API KEY") || 
+        friendlyError.toUpperCase().includes("API_KEY") || 
+        friendlyError.toLowerCase().includes("key not found")
+      ) {
+        friendlyError = "Gemini API Key မတွေ့ရှိပါ သို့မဟုတ် လွဲမှားနေပါသည်။ ကျေးဇူးပြု၍ .env သို့မဟုတ် Settings တွင် API Key ထည့်ထားမှု ပြန်လည်စစ်ဆေးပေးပါ။";
+      }
+      
+      showError(`ဘာသာပြန်ဆိုမှု မအောင်မြင်ပါ- ${friendlyError}`);
     } finally {
       setIsTranslating(false);
     }
@@ -730,47 +812,6 @@ export default function App() {
   // Language helper translations (Burmese is default, but clean bilingual captions are used)
   return (
     <div className="min-h-screen bg-[#F8FAFC]">
-      {/* Visual Header / Banner */}
-      <header className="bg-white border-b border-slate-100 shadow-xs sticky top-0 z-40">
-        <div className="max-w-6xl mx-auto px-4 py-4 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center text-white shadow-md shadow-indigo-100">
-              <Languages className="w-5 h-5 animate-pulse" />
-            </div>
-            <div>
-              <h1 className="text-xl md:text-2xl font-bold tracking-tight text-slate-800 font-display flex items-center gap-2">
-                မြန်မာ အမြန်ဘာသာပြန်နှင့် Dictionary ဖတ်စက်
-              </h1>
-              <p className="text-xs text-slate-500 font-medium">
-                English to Myanmar Smart Sentence Translator & Dictionary Lookup
-              </p>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-3">
-            <span className="text-xs font-mono px-3 py-1.5 rounded-full bg-slate-100 text-slate-600 flex items-center gap-1.5">
-              <BookOpen className="w-3.5 h-3.5" />
-              Dictionary:{" "}
-              <b className="text-slate-800">
-                {dictionarySource === "sample" 
-                  ? "နမူနာ စကားလုံး ၅၀" 
-                  : `${loadedFileName || "ထည့်သွင်းပြီး"} (${dictionaryMap.size.toLocaleString()} လုံး)`}
-              </b>
-            </span>
-
-            {dictionarySource === "user_file" && (
-              <button
-                onClick={handleResetToSample}
-                className="text-xs font-medium text-rose-600 hover:text-rose-700 hover:bg-rose-50 px-2.5 py-1.5 rounded-lg transition-colors border border-dashed border-rose-200"
-                title="နမူနာစကားလုံးများသို့ ပြန်ပြောင်းရန်"
-              >
-                Reset
-              </button>
-            )}
-          </div>
-        </div>
-      </header>
-
       <main className="max-w-6xl mx-auto px-4 py-8">
         
         {/* Dynamic Alerts */}
@@ -810,13 +851,15 @@ export default function App() {
               <div className="absolute top-0 left-0 right-0 h-[2px] bg-indigo-600" />
               
               <div className="flex justify-between items-center mb-4">
-                <label className="text-sm font-semibold tracking-wide text-slate-700 uppercase flex items-center gap-2">
+                <div className="flex items-center gap-2 text-sm font-semibold text-indigo-600">
                   <Sparkles className="w-4 h-4 text-indigo-500" />
-                  စစ်ဆေးလိုသော အင်္ဂလိပ် စာသား (English sentence / paragraph)
-                </label>
+                </div>
                 <button
-                  onClick={() => setInputText("")}
-                  className="text-xs text-slate-400 hover:text-rose-600 transition-colors py-1 px-2.5 rounded hover:bg-rose-50"
+                  onClick={() => {
+                    setInputText("");
+                    handleRemoveImage();
+                  }}
+                  className="text-xs text-slate-400 hover:text-rose-600 transition-colors py-1 px-2.5 rounded hover:bg-rose-50 font-medium cursor-pointer"
                   disabled={isTranslating}
                 >
                   အကုန်ဖျက်ရန်
@@ -826,20 +869,73 @@ export default function App() {
               <textarea
                 value={inputText}
                 onChange={(e) => setInputText(e.target.value)}
-                placeholder="လေ့လာလိုသော အင်္ဂလိပ် ဝါကျ သို့မဟုတ် စာပိုဒ်တိုများကို ဤနေရာတွင် ထည့်သွင်းပါ..."
+                placeholder="မြန်မာဘာသာပြန်လိုသော အင်္ဂလိပ်စာကို ထည့်ပါ။"
                 rows={5}
-                className="w-full text-base p-4 rounded-xl bg-slate-50 border border-slate-200 text-slate-800 placeholder-slate-400 focus:outline-hidden focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500 focus:bg-white resize-y transition-all font-sans leading-relaxed"
+                className="w-full text-base p-4 rounded-xl bg-slate-50 border border-slate-200 text-slate-800 placeholder-slate-400 focus:outline-hidden focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500 focus:bg-white resize-y transition-all font-sans leading-relaxed text-slate-900"
                 disabled={isTranslating}
               />
 
+              {/* Image attachment / input control */}
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-3">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="file"
+                    ref={imageInputRef}
+                    accept="image/*"
+                    onChange={handleImageChange}
+                    className="hidden"
+                    disabled={isTranslating}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => imageInputRef.current?.click()}
+                    disabled={isTranslating}
+                    className="text-xs font-semibold px-3 py-1.5 border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 hover:text-indigo-600 rounded-lg flex items-center gap-1.5 cursor-pointer disabled:opacity-50 transition-all active:scale-95"
+                  >
+                    <ImageIcon className="w-4 h-4 text-indigo-500" />
+                    📷 ပုံတင်ဘာသာပြန်ရန်
+                  </button>
+                </div>
+              </div>
+
+              {selectedImage && (
+                <div className="mt-4 p-3 bg-indigo-50/40 rounded-xl border border-indigo-100/50 flex items-center justify-between gap-3 animate-fade-in animate-duration-200">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <img 
+                      src={selectedImage} 
+                      alt="Selected upload" 
+                      className="w-12 h-12 object-cover rounded-md border border-indigo-100 shadow-3xs"
+                    />
+                    <div className="min-w-0">
+                      <p className="text-xs font-semibold text-slate-700 truncate max-w-[200px] sm:max-w-xs">
+                        {selectedImageName}
+                      </p>
+                      <span className="text-[10px] text-slate-400 font-mono uppercase">
+                        {(selectedImageMime || "").split("/")[1] || "image"}
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleRemoveImage}
+                    className="text-slate-400 hover:text-rose-600 p-1.5 rounded-lg hover:bg-white transition-all border border-transparent hover:border-slate-100 cursor-pointer"
+                    title="Remove attached image"
+                    disabled={isTranslating}
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              )}
+
               {/* Sample helper sentences clickers */}
-              <div className="mt-3 flex flex-wrap items-center gap-2">
+              <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-slate-50 pt-3">
                 <span className="text-xs text-slate-400 flex items-center gap-1">
                   <HelpCircle className="w-3.5 h-3.5" />
                   စမ်းသပ်ရန် စာကြောင်းများ:
                 </span>
                 
                 <button
+                  type="button"
                   onClick={() => loadTestSentence("A quick brown fox jumps over the lazy dog.")}
                   className="text-xs px-3 py-1.5 bg-slate-50 border border-slate-200 hover:border-indigo-200 hover:bg-indigo-50 hover:text-indigo-600 text-slate-600 rounded-lg transition-all"
                   title="A classic sentence with all alphabets"
@@ -847,7 +943,8 @@ export default function App() {
                   🦊 Black Fox jump
                 </button>
                 <button
-                  onClick={() => loadTestSentence("He studies English vocabulary using a digital dictionary to improve his reading life.")}
+                  type="button"
+                  onClick={() => loadTestSentence("Studies show studies improve vocabulary.")}
                   className="text-xs px-3 py-1.5 bg-slate-50 border border-slate-200 hover:border-indigo-200 hover:bg-indigo-50 hover:text-indigo-600 text-slate-600 rounded-lg transition-all"
                 >
                   📖 Studies vocabulary
@@ -869,8 +966,7 @@ export default function App() {
                   ) : (
                     <>
                       <Languages className="w-5 h-5" />
-                      ဘာသာပြန်ပြီး ဝေါဟာရစကားလုံးများ တွဲဖက်ရှာဖွေပါ
-                      <ArrowRight className="w-4 h-4" />
+                      ဘာသာပြန်၍ E-M dictionary မှ ဝေါဟာရ ရှာမည်။
                     </>
                   )}
                 </button>
@@ -893,7 +989,7 @@ export default function App() {
                     <div className="flex justify-between items-center mb-4">
                       <h3 className="text-sm font-bold tracking-wider text-emerald-700 uppercase flex items-center gap-2">
                         <Sparkles className="w-4 h-4 text-emerald-500" />
-                        မြန်မာဘာသာပြန်ချက် (Google Gemini AI Translation)
+                        မြန်မာဘာသာပြန်ချက်
                       </h3>
 
                       <button
@@ -915,106 +1011,9 @@ export default function App() {
                     </div>
 
                     <div className="p-4 bg-emerald-50/50 border border-emerald-100/55 rounded-xl">
-                      <p className="text-lg text-slate-800 leading-relaxed font-medium">
+                      <p className="text-lg text-slate-800 leading-relaxed font-semibold">
                         {translationResult.translation}
                       </p>
-                    </div>
-                  </div>
-
-                  {/* Word by word listings (SKIPPING prepositions, pronouns, articles etc as requested) */}
-                  <div className="space-y-4">
-                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                      <div>
-                        <h3 className="text-base font-bold text-slate-800 flex items-center gap-2">
-                          <BookMarked className="w-5 h-5 text-indigo-500" />
-                          ဝေါဟာရနှင့် ဖွင့်ဆိုချက်များ (Vocabulary Lookups)
-                        </h3>
-                        <p className="text-xs text-slate-500 mt-0.5">
-                          အင်္ဂလိပ်စာလုံးထဲမှ ဝိဘတ်၊ နာမ်စား၊ အာတီကယ်များ ချန်လှပ်၍ သက်ဆိုင်ရာ အဓိပ္ပါယ်များကို စီစဉ်ထုတ်ပေးထားခြင်းဖြစ်ပါသည်
-                        </p>
-                      </div>
-                      <span className="text-xs font-mono px-3 py-1 bg-indigo-50 border border-indigo-100 text-indigo-600 rounded-full font-semibold shrink-0">
-                        {translationResult.words.length} Words Traced
-                      </span>
-                    </div>
-
-                    <div className="space-y-4">
-                      {translationResult.words.map((word, index) => {
-                        return (
-                          <motion.div
-                            key={index}
-                            initial={{ opacity: 0, x: -10 }}
-                            animate={{ opacity: 1, x: 0 }}
-                            transition={{ delay: index * 0.05 }}
-                            className="bg-white rounded-xl border border-slate-200/80 hover:border-slate-300 shadow-xs overflow-hidden transition-all duration-200 group"
-                          >
-                            <div className="p-5">
-                              {/* Word identifiers tags */}
-                              <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
-                                <div className="flex items-center gap-2.5">
-                                  <span className="text-sm font-mono text-slate-400 font-bold bg-slate-50 w-6 h-6 rounded-full flex items-center justify-center border border-slate-100">
-                                    {index + 1}
-                                  </span>
-                                  <h4 className="text-lg font-bold text-slate-900 tracking-tight group-hover:text-indigo-600 transition-colors">
-                                    {word.original}
-                                  </h4>
-                                  <span className="text-xs text-slate-400">➔</span>
-                                  <span className="text-md font-extrabold text-indigo-600 bg-indigo-50/50 px-2.5 py-0.5 rounded-md border border-indigo-100/30">
-                                    {word.base}
-                                  </span>
-                                  <span className="text-xs font-mono px-2 py-0.5 rounded-md bg-slate-100 text-slate-500 uppercase tracking-wider font-semibold">
-                                    {word.pos}
-                                  </span>
-                                </div>
-
-                                <button
-                                  onClick={() => {
-                                    copyText(word.base);
-                                    setCopiedIndex(index);
-                                    setTimeout(() => setCopiedIndex(null), 1500);
-                                  }}
-                                  className="text-xs text-slate-400 hover:text-indigo-600 opacity-0 group-hover:opacity-100 transition-opacity p-1.5 rounded hover:bg-slate-50"
-                                  title="Copy root word"
-                                >
-                                  {copiedIndex === index ? (
-                                    <Check className="w-3.5 h-3.5 text-emerald-500" />
-                                  ) : (
-                                    <Copy className="w-3.5 h-3.5" />
-                                  )}
-                                </button>
-                              </div>
-
-                              {/* Definition lookups */}
-                              <div className="mt-3">
-                                {word.dictionary_definition ? (
-                                  <div className="space-y-1">
-                                    <div className="text-xs font-semibold tracking-wider text-indigo-600 uppercase flex items-center gap-1.5 mb-1 bg-indigo-50/20 max-w-max px-2 py-0.5 rounded">
-                                      <BookOpen className="w-3 h-3" />
-                                      E-M Dictionary ဖွင့်ဆိုချက်အမှန်
-                                    </div>
-                                    <p className="text-slate-700 font-medium whitespace-pre-wrap leading-relaxed border-l-3 border-indigo-500 pl-3">
-                                      {word.dictionary_definition}
-                                    </p>
-                                  </div>
-                                ) : (
-                                  <div className="space-y-1">
-                                    <div className="text-xs font-semibold tracking-wider text-amber-600 uppercase flex items-center gap-1.5 mb-1 bg-amber-50/30 max-w-max px-2 py-0.5 rounded">
-                                      <Sparkles className="w-3 h-3 text-amber-500" />
-                                      Gemini ရိုးရှင်းဝါကျဆိုင်ရာ အဓိပ္ပါယ် (Fallback Context)
-                                    </div>
-                                    <p className="text-slate-600 italic whitespace-pre-line leading-relaxed border-l-3 border-amber-300 pl-3 bg-amber-50/20 py-2 rounded-r-lg pr-3">
-                                      {word.fallback_my}
-                                    </p>
-                                    <p className="text-[11px] text-amber-600/80 pl-3">
-                                      * ဤစကားလုံးကို loaded dictionary ထဲတွင်မတွေ့ရသဖြင့် Gemini model က ဝါကျအလိုက် အနီးစပ်ဆုံး တိုက်ရိုက်ဘာသာပြန်ပေးထားပါသည်။
-                                    </p>
-                                  </div>
-                                )}
-                              </div>
-                            </div>
-                          </motion.div>
-                        );
-                      })}
                     </div>
                   </div>
                 </motion.div>
@@ -1023,202 +1022,443 @@ export default function App() {
 
           </section>
 
-          {/* Sidebar Area: 5 columns on large desktop. Holds Dictionary Loader & Tools */}
-          <section className="lg:col-span-5 space-y-8">
-            
-            {/* 1. Quick Search lookup widget */}
-            <div className="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-6 relative">
-              <h3 className="text-sm font-bold tracking-wider text-slate-700 uppercase flex items-center gap-2 mb-4">
-                <Search className="w-4 h-4 text-slate-500" />
-                အဘိဓာန်အမြန်ရှာ (Single Word Dictionary Search)
-              </h3>
-
-              <div className="relative">
-                <input
-                  type="text"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="ဥပမာ- learn, beautiful, fox..."
-                  className="w-full text-sm pl-10 pr-4 py-2.5 rounded-xl border border-slate-200 text-slate-800 focus:outline-hidden focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500"
-                />
-                <div className="absolute left-3.5 top-3 text-slate-400">
-                  <Search className="w-4.5 h-4.5" />
-                </div>
+          {/* Sidebar Area: 5 columns on large desktop. Holds Dictionary Loader & Tools in a Tabbed Interface */}
+          <section className="lg:col-span-5">
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden flex flex-col">
+              {/* Tab Navigation Menu Bar */}
+              <div className="flex border-b border-slate-100 bg-slate-50/60 p-1.5 gap-1 overflow-x-auto scroller-hide">
+                <button
+                  onClick={() => setActiveRightTab("vocab")}
+                  className={`flex items-center gap-1.5 px-3 py-2 text-xs font-bold rounded-lg transition-all whitespace-nowrap cursor-pointer flex-1 justify-center ${
+                    activeRightTab === "vocab"
+                      ? "bg-white text-indigo-600 shadow-2xs border border-indigo-100"
+                      : "text-slate-500 hover:text-slate-800 hover:bg-white/40"
+                  }`}
+                >
+                  <BookMarked className="w-3.5 h-3.5" />
+                  ဝေါဟာရများ {translationResult ? `(${translationResult.words.length})` : ""}
+                </button>
+                <button
+                  onClick={() => setActiveRightTab("search")}
+                  className={`flex items-center gap-1.5 px-3 py-2 text-xs font-bold rounded-lg transition-all whitespace-nowrap cursor-pointer flex-1 justify-center ${
+                    activeRightTab === "search"
+                      ? "bg-white text-indigo-600 shadow-2xs border border-indigo-100"
+                      : "text-slate-500 hover:text-slate-800 hover:bg-white/40"
+                  }`}
+                >
+                  <Search className="w-3.5 h-3.5" />
+                  အဘိဓာန်ရှာဖွေမှု
+                </button>
+                <button
+                  onClick={() => setActiveRightTab("dict")}
+                  className={`flex items-center gap-1.5 px-3 py-2 text-xs font-bold rounded-lg transition-all whitespace-nowrap cursor-pointer flex-1 justify-center ${
+                    activeRightTab === "dict"
+                      ? "bg-white text-indigo-600 shadow-2xs border border-indigo-100"
+                      : "text-slate-500 hover:text-slate-800 hover:bg-white/40"
+                  }`}
+                >
+                  <Upload className="w-3.5 h-3.5" />
+                  ဖိုင်တင်ရန်
+                </button>
+                <button
+                  onClick={() => setActiveRightTab("history")}
+                  className={`flex items-center gap-1.5 px-3 py-2 text-xs font-bold rounded-lg transition-all whitespace-nowrap cursor-pointer flex-1 justify-center ${
+                    activeRightTab === "history"
+                      ? "bg-white text-indigo-600 shadow-2xs border border-indigo-100"
+                      : "text-slate-500 hover:text-slate-800 hover:bg-white/40"
+                  }`}
+                >
+                  <History className="w-3.5 h-3.5" />
+                  မှတ်တမ်း {history.length > 0 ? `(${history.length})` : ""}
+                </button>
               </div>
 
-              {searchQuery.trim() && (
-                <div className="mt-4 p-4 bg-slate-50 rounded-xl border border-slate-100 transition-all">
-                  <h4 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-1.5">
-                    Results for &quot;{searchQuery.trim()}&quot; :
-                  </h4>
-                  {searchResult ? (
-                    <div className="text-slate-800 font-medium whitespace-pre-wrap leading-relaxed pr-2">
-                      {searchResult}
-                    </div>
-                  ) : (
-                    <div className="text-xs text-rose-500 font-medium flex items-center gap-1.5">
-                      <AlertCircle className="w-4.5 h-4.5" />
-                      မတွေ့ရှိပါ။ သင့်ဖိုင်ထဲရှိ စကားလုံးလုံးဝတူကိုသာ ရှာနိုင်မည်ဖြစ်သည်။
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
+              {/* Tab Panel Contents */}
+              <div className="p-5 min-h-[350px]">
+                <AnimatePresence mode="wait">
+                  {activeRightTab === "vocab" && (
+                    <motion.div
+                      key="vocab-tab"
+                      initial={{ opacity: 0, scale: 0.98 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      exit={{ opacity: 0, scale: 0.98 }}
+                      transition={{ duration: 0.15 }}
+                      className="space-y-4"
+                    >
+                      {translationResult ? (
+                        <div className="space-y-4">
+                          <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+                            <div>
+                              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-700 flex items-center gap-1.5">
+                                <BookMarked className="w-4 h-4 text-indigo-500" />
+                                ဝေါဟာရနှင့် ဖွင့်ဆိုချက်များ
+                              </h3>
+                              <p className="text-[10px] text-slate-400 mt-0.5">
+                                ဝိဘတ်၊ နာမ်စား၊ အာတီကယ်များ ချန်လှပ်၍ တိုက်ဆိုင်ရှာဖွေမှု
+                              </p>
+                            </div>
+                            <span className="text-[10px] font-sans px-2.5 py-0.5 bg-indigo-50 border border-indigo-100 text-indigo-650 rounded-full font-bold">
+                              {translationResult.words.length} Words Traced
+                            </span>
+                          </div>
 
-            {/* 2. File Uploader Container */}
-            <div className="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-6 space-y-6">
-              
-              <div>
-                <h3 className="text-sm font-bold tracking-wider text-slate-700 uppercase flex items-center gap-2">
-                  <Upload className="w-4 h-4 text-indigo-500" />
-                  Dictionary ဖိုင်တင်ရန် (Load Dictionary File)
-                </h3>
-                <p className="text-xs text-slate-400 mt-1">
-                  E to Myanmar dictionary txt file ကို တင်ပေးပါ။ (စကားလုံး တစ်ကြောင်းစီတွင် separation တစ်မျိုးမျိုး ပါဝင်ရပါမည်)
-                </p>
-              </div>
+                          {/* Selection Dropdown Form */}
+                          <div className="bg-indigo-50/50 p-3 rounded-xl border border-indigo-100/60 flex flex-col gap-1.5 shadow-3xs">
+                            <label className="text-xs font-bold text-indigo-950 flex items-center gap-1" htmlFor="traced-words-select-sb">
+                              <BookOpen className="w-3.5 h-3.5 text-indigo-600" />
+                              စကားလုံး ရွေးချယ်ရန် (Select Traced Word):
+                            </label>
+                            <select
+                              id="traced-words-select-sb"
+                              value={selectedWordIndex}
+                              onChange={(e) => setSelectedWordIndex(Number(e.target.value))}
+                              className="w-full bg-white border border-slate-200 text-slate-800 px-3 py-1.5 rounded-lg text-xs font-semibold focus:outline-hidden focus:ring-1 focus:ring-indigo-500 shadow-3xs cursor-pointer appearance-none bg-[url('data:image/svg+xml;charset=US-ASCII,%3Csvg%20width%3D%2220%22%20height%3D%2220%22%20viewBox%3D%220%200%2020%2020%22%20fill%3D%22none%22%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%3E%3Cpath%20d%3D%22M5%207.5L10%2012.5L15%207.5%22%20stroke%3D%22%23475569%22%20stroke-width%3D%221.67%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22/%3E%3C/svg%3E')] bg-[length:18px_18px] bg-[right_10px_center] bg-no-repeat pr-8"
+                            >
+                              {translationResult.words.map((word, idx) => (
+                                <option key={idx} value={idx}>
+                                  {idx + 1}. {word.original} ({word.pos})
+                                </option>
+                              ))}
+                            </select>
+                          </div>
 
-              {/* Drag and Drop area */}
-              <div
-                onDragOver={handleDragOver}
-                onDragLeave={handleDragLeave}
-                onDrop={handleDrop}
-                onClick={() => fileInputRef.current?.click()}
-                className={`border-2 border-dashed rounded-xl p-6 text-center cursor-pointer transition-all ${
-                  isDragging 
-                    ? "border-indigo-500 bg-indigo-50/40 text-indigo-700" 
-                    : "border-slate-200 hover:border-slate-300 hover:bg-slate-50 text-slate-600"
-                }`}
-              >
-                <input
-                  type="file"
-                  ref={fileInputRef}
-                  onChange={handleLocalFileUpload}
-                  accept=".txt"
-                  className="hidden"
-                />
-                
-                <Upload className="w-8 h-8 mx-auto text-indigo-500 mb-2.5" />
-                <p className="text-sm font-bold">
-                  {isDragging ? "ဤနေရာသို့ ဖိုင်ကိုလွှတ်ချပါ" : "နှိပ်၍ တင်ပါ သို့မဟုတ် ဖိုင်ဆွဲထည့်ပါ"}
-                </p>
-                <p className="text-xs text-slate-400 mt-1">
-                  Only .txt dictionary files allowed (Max 15MB)
-                </p>
-              </div>
+                          {/* Display active word card */}
+                          {translationResult.words.length > 0 ? (
+                            (() => {
+                              const word = translationResult.words[selectedWordIndex] || translationResult.words[0];
+                              const index = translationResult.words[selectedWordIndex] ? selectedWordIndex : 0;
 
-              {/* Server-side discovered files */}
-              <div className="space-y-3">
-                <div className="flex items-center justify-between">
-                  <h4 className="text-xs font-bold text-slate-500 uppercase tracking-wider flex items-center gap-1">
-                    <FileText className="w-3.5 h-3.5" />
-                    ရရှိနိုင်သော Server Dictionary ဖိုင်များ
-                  </h4>
-                  <button
-                    onClick={scanServerFiles}
-                    className="text-slate-400 hover:text-indigo-600 p-1 rounded-sm"
-                    title="ဆာဗာဖိုင်များ ပြန်လည်ရှာဖွေရန်"
-                    disabled={isScanningServer}
-                  >
-                    <RefreshCw className={`w-3.5 h-3.5 ${isScanningServer ? "animate-spin" : ""}`} />
-                  </button>
-                </div>
+                              return (
+                                <motion.div
+                                  key={index}
+                                  initial={{ opacity: 0, y: 8 }}
+                                  animate={{ opacity: 1, y: 0 }}
+                                  className="bg-slate-50/50 rounded-xl border border-slate-150 p-4 space-y-3"
+                                >
+                                  {/* Header metadata */}
+                                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-2.5">
+                                    <div className="flex items-center gap-1.5 flex-wrap">
+                                      <span className="text-[10px] font-mono text-slate-400 font-bold bg-white w-5 h-5 rounded-full flex items-center justify-center border border-slate-200">
+                                        {index + 1}
+                                      </span>
+                                      <h4 className="text-sm font-bold text-slate-900 truncate max-w-[120px]" title={word.original}>
+                                        {word.original}
+                                      </h4>
+                                      <span className="text-[10px] text-slate-400">➔</span>
+                                      <span className="text-xs font-extrabold text-indigo-600 bg-indigo-50 border border-indigo-100/40 px-2 py-0.5 rounded-md">
+                                        {word.base}
+                                      </span>
+                                      <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-slate-200/70 text-slate-600 uppercase font-semibold">
+                                        {word.pos}
+                                      </span>
+                                    </div>
 
-                {serverFiles.length > 0 ? (
-                  <div className="border border-slate-100 rounded-xl divide-y divide-slate-50 bg-slate-50/50 max-h-48 overflow-y-auto">
-                    {serverFiles.map((srv, idx) => (
-                      <div key={idx} className="p-3 flex items-center justify-between gap-2">
-                        <div className="min-w-0 flex-1">
-                          <p className="text-xs font-medium text-slate-800 truncate" title={srv.filename}>
-                            📄 {srv.filename}
-                          </p>
-                          <p className="text-[10px] text-slate-400">
-                            {(srv.size / 1024).toFixed(1)} KB • {new Date(srv.mtime).toLocaleDateString()}
+                                    {/* Small paginator & copy */}
+                                    <div className="flex items-center gap-1">
+                                      <button
+                                        onClick={() => setSelectedWordIndex((prev) => Math.max(0, prev - 1))}
+                                        disabled={index === 0}
+                                        className="p-1 px-1.5 text-[10px] font-bold bg-white border border-slate-200 text-slate-600 rounded disabled:opacity-30 hover:bg-slate-50 disabled:pointer-events-none cursor-pointer"
+                                      >
+                                        ◀
+                                      </button>
+                                      <button
+                                        onClick={() => setSelectedWordIndex((prev) => Math.min(translationResult.words.length - 1, prev + 1))}
+                                        disabled={index === translationResult.words.length - 1}
+                                        className="p-1 px-1.5 text-[10px] font-bold bg-white border border-slate-200 text-slate-600 rounded disabled:opacity-30 hover:bg-slate-50 disabled:pointer-events-none cursor-pointer"
+                                      >
+                                        ▶
+                                      </button>
+                                      <button
+                                        onClick={() => {
+                                          copyText(word.base);
+                                          setCopiedIndex(index);
+                                          setTimeout(() => setCopiedIndex(null), 1500);
+                                        }}
+                                        className="text-slate-400 hover:text-indigo-600 p-1 rounded hover:bg-white border border-slate-200 transition-all ml-0.5"
+                                        title="Copy root word"
+                                      >
+                                        {copiedIndex === index ? (
+                                          <Check className="w-3 h-3 text-emerald-500" />
+                                        ) : (
+                                          <Copy className="w-3 h-3" />
+                                        )}
+                                      </button>
+                                    </div>
+                                  </div>
+
+                                  {/* Definition container */}
+                                  <div className="pt-1">
+                                    {word.dictionary_definition ? (
+                                      <div className="space-y-1.5">
+                                        <div className="text-[10px] font-bold tracking-wider text-indigo-600 uppercase flex items-center gap-1">
+                                          <BookOpen className="w-3 h-3" />
+                                          E-M Dictionary ဖွင့်ဆိုချက်အမှန်
+                                        </div>
+                                        <div className="text-xs text-slate-755 font-medium whitespace-pre-wrap leading-relaxed border-l-3 border-indigo-500 pl-2.5 bg-indigo-50/10 py-1.5 rounded-r">
+                                          {word.dictionary_definition}
+                                        </div>
+                                      </div>
+                                    ) : (
+                                      <div className="space-y-1.5">
+                                        <div className="text-[10px] font-bold tracking-wider text-amber-600 uppercase flex items-center gap-1">
+                                          <Sparkles className="w-3 h-3 text-amber-500" />
+                                          Gemini ရှင်းလင်းချက် (Fallback)
+                                        </div>
+                                        <div className="text-xs text-slate-600 italic whitespace-pre-line leading-relaxed border-l-3 border-amber-300 pl-2.5 bg-amber-50/25 py-2 rounded-r pr-2">
+                                          {word.fallback_my}
+                                        </div>
+                                        <p className="text-[9px] text-amber-500/80 pl-2.5 leading-normal">
+                                          * ဤစကားလုံးကို loaded dictionary ထဲတွင်မတွေ့ရသဖြင့် ဝါကျအလိုက် Gemini က တိုက်ရိုက်အဓိပ္ပါယ် ဖွင့်ပေးထားသည်။
+                                        </p>
+                                      </div>
+                                    )}
+                                  </div>
+                                </motion.div>
+                              );
+                            })()
+                          ) : null}
+                        </div>
+                      ) : (
+                        <div className="text-center py-12 text-slate-400 space-y-3">
+                          <BookMarked className="w-10 h-10 mx-auto stroke-1 text-slate-350" />
+                          <p className="text-xs max-w-xs mx-auto leading-relaxed">
+                            အင်္ဂလိပ်ဝါကျကို ဘာသာပြန်စစ်ဆေးလိုက်ပါက ၎င်းတွင်ပါရှိသော ဝေါဟာရနှင့် ဖွင့်ဆိုချက်များ၊ စကားလုံး ရွေးချယ်မှုများနှင့် E-M Dictionary တိုက်ဆိုင်မှုများကို ဤသီးသန့် panel တွင် မြင်တွေ့လေ့လာနိုင်မည် ဖြစ်သည်။
                           </p>
                         </div>
-                        <button
-                          onClick={() => handleLoadServerFile(srv.filename)}
-                          disabled={isLoadingServerFile !== null}
-                          className="text-xs bg-white hover:bg-indigo-50 hover:text-indigo-600 border border-slate-200 hover:border-indigo-200 px-2.5 py-1 rounded-md text-slate-700 font-semibold transition-all shrink-0 cursor-pointer disabled:opacity-50"
-                        >
-                          {isLoadingServerFile === srv.filename ? "Loading..." : "Load File"}
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="p-3 bg-slate-50 rounded-xl text-center border border-dashed border-slate-100">
-                    <p className="text-[11px] text-slate-400 italic">
-                      ဆာဗာ workspace root ထဲတွင် မည်သည့် dictionary .txt ဖိုင်မျှ မတွေ့သေးပါ။ Code sidebar တွင် file ကိုတင်ပြီး refresh လုပ်နိုင်သည်။
-                    </p>
-                  </div>
-                )}
-              </div>
+                      )}
+                    </motion.div>
+                  )}
 
-              {/* Debug Parse Details */}
-              {parserDebugInfo && (
-                <div className="bg-slate-50 p-4 rounded-xl border border-slate-100 text-xs text-slate-600 space-y-2">
-                  <div className="font-bold text-slate-700 text-[11px] uppercase tracking-wider">
-                    📜 Parsing Debug Info
-                  </div>
-                  <div>- ဖိုင်အကြောင်းရေစုစုပေါင်း: <b className="text-slate-800">{parserDebugInfo.totalLines.toLocaleString()} lines</b></div>
-                  <div>- အဘိဓာန်အညွှန်းပေါင်း: <b className="text-emerald-600">{parserDebugInfo.parsedCount.toLocaleString()} words matched</b></div>
-                  <div className="border-t border-slate-200/60 pt-2 mt-1">
-                    <span className="font-semibold block mb-1 text-[10px] text-slate-400 uppercase">စကားလုံး နမူနာ ၅ ခု-</span>
-                    <ul className="list-disc pl-4 space-y-0.5 text-slate-500 font-mono text-[11px] break-all">
-                      {parserDebugInfo.sampleEntries.map((sm, i) => (
-                        <li key={i}>{sm}</li>
-                      ))}
-                    </ul>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* 3. Translation History */}
-            {history.length > 0 && (
-              <div className="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-6 space-y-4">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-sm font-bold tracking-wider text-slate-700 uppercase flex items-center gap-2">
-                    <FileText className="w-4 h-4 text-slate-500" />
-                    ယခင်ရှာဖွေမှုမှတ်တမ်း (Recent History)
-                  </h3>
-                  <button
-                    onClick={() => setHistory([])}
-                    className="text-xs text-rose-500 hover:bg-rose-50 px-2 py-1 rounded transition-colors"
-                  >
-                    မှတ်တမ်းဖြတ်ပါ
-                  </button>
-                </div>
-
-                <div className="space-y-2.5 divide-y divide-slate-100 max-h-80 overflow-y-auto pr-1">
-                  {history.map((hist) => (
-                    <div 
-                      key={hist.id} 
-                      className="pt-2.5 first:pt-0 cursor-pointer group"
-                      onClick={() => {
-                        setInputText(hist.originalText);
-                        setTranslationResult({
-                          translation: hist.translation,
-                          words: hist.words,
-                        });
-                      }}
+                  {activeRightTab === "search" && (
+                    <motion.div
+                      key="search-tab"
+                      initial={{ opacity: 0, scale: 0.98 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      exit={{ opacity: 0, scale: 0.98 }}
+                      transition={{ duration: 0.15 }}
+                      className="space-y-4"
                     >
-                      <p className="text-xs font-semibold text-slate-700 group-hover:text-indigo-600 truncate">
-                        {hist.originalText}
-                      </p>
-                      <p className="text-xs text-emerald-600 truncate mt-0.5">
-                        {hist.translation}
-                      </p>
-                      <p className="text-[10px] text-slate-400 mt-1">
-                        {new Date(hist.timestamp).toLocaleTimeString()}
-                      </p>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
+                      <div className="border-b border-slate-100 pb-2.5">
+                        <h3 className="text-xs font-bold uppercase tracking-wider text-slate-750 flex items-center gap-1.5">
+                          <Search className="w-4 h-4 text-slate-500" />
+                          အဘိဓာန်အမြန်ရှာ (Single Word Search)
+                        </h3>
+                        <p className="text-[10px] text-slate-400 mt-0.5">
+                          ဒေတာဘေ့စ်ထဲမှ စကားလုံးတစ်လုံးချင်းစီကို တိုက်ရိုက် ရှာဖွေနိုင်သည့်အကွက်
+                        </p>
+                      </div>
 
+                      <div className="relative">
+                        <input
+                          type="text"
+                          value={searchQuery}
+                          onChange={(e) => setSearchQuery(e.target.value)}
+                          placeholder="learn, dictionary, code, test..."
+                          className="w-full text-xs pl-9 pr-4 py-2 rounded-xl border border-slate-200 text-slate-800 focus:outline-hidden focus:ring-1 focus:ring-indigo-500 placeholder-slate-400"
+                        />
+                        <div className="absolute left-3.5 top-2.5 text-slate-400">
+                          <Search className="w-3.5 h-3.5" />
+                        </div>
+                      </div>
+
+                      {searchQuery.trim() && (
+                        <div className="mt-3 p-3.5 bg-slate-50 rounded-xl border border-slate-100 transition-all">
+                          <h4 className="text-[10px] font-bold text-slate-450 uppercase tracking-widest mb-1.5">
+                            Results for &quot;{searchQuery.trim()}&quot; :
+                          </h4>
+                          {searchResult ? (
+                            <div className="text-xs text-slate-800 font-medium whitespace-pre-wrap leading-relaxed pr-1 max-h-56 overflow-y-auto">
+                              {searchResult}
+                            </div>
+                          ) : (
+                            <div className="text-[11px] text-rose-500 font-semibold flex items-center gap-1 pt-1">
+                              <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                              ရှာမတွေ့ပါ။ စာလုံးပေါင်းမှန်ကန်မှုကို စစ်ဆေးပေးပါ။
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </motion.div>
+                  )}
+
+                  {activeRightTab === "dict" && (
+                    <motion.div
+                      key="dict-tab"
+                      initial={{ opacity: 0, scale: 0.98 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      exit={{ opacity: 0, scale: 0.98 }}
+                      transition={{ duration: 0.15 }}
+                      className="space-y-4"
+                    >
+                      <div className="border-b border-slate-100 pb-2.5">
+                        <h3 className="text-xs font-bold uppercase tracking-wider text-slate-750 flex items-center gap-1.5">
+                          <Upload className="w-4 h-4 text-indigo-500" />
+                          Dictionary ဖိုင်တင်ရန် (Manage Database)
+                        </h3>
+                        <p className="text-[10px] text-slate-450 mt-0.5">
+                          စကားလုံး ဖွင့်ဆိုချက်များပါဝင်သော TXT ဖိုင်များ တင်သွင်းရန်
+                        </p>
+                      </div>
+
+                      {/* Drag & Drop */}
+                      <div
+                        onDragOver={handleDragOver}
+                        onDragLeave={handleDragLeave}
+                        onDrop={handleDrop}
+                        onClick={() => fileInputRef.current?.click()}
+                        className={`border-2 border-dashed rounded-xl p-4.5 text-center cursor-pointer transition-all ${
+                          isDragging 
+                            ? "border-indigo-500 bg-indigo-50/45 text-indigo-700" 
+                            : "border-slate-200 hover:border-slate-300 hover:bg-slate-50 text-slate-605"
+                        }`}
+                      >
+                        <input
+                          type="file"
+                          ref={fileInputRef}
+                          onChange={handleLocalFileUpload}
+                          accept=".txt"
+                          className="hidden"
+                        />
+                        
+                        <Upload className="w-5 h-5 mx-auto text-indigo-500 mb-1.5" />
+                        <p className="text-xs font-bold">
+                          {isDragging ? "ဤနေရာသို့ လွှတ်ချလိုက်ပါ" : "နှိပ်၍ တင်ပါ သို့မဟုတ် ဖိုင်ဆွဲထည့်ပါ"}
+                        </p>
+                        <p className="text-[9px] text-slate-400 mt-0.5">
+                          TXT dictionary lines (Max 15MB)
+                        </p>
+                      </div>
+
+                      {/* Server files load */}
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between">
+                          <h4 className="text-[10px] font-bold text-slate-500 uppercase tracking-wider flex items-center gap-1">
+                            <FileText className="w-3.5 h-3.5" />
+                            Server Dictionary ဖိုင်များ
+                          </h4>
+                          <button
+                            onClick={scanServerFiles}
+                            className="text-slate-400 hover:text-indigo-600 p-0.5 rounded transition-all cursor-pointer"
+                            title="ပြန်လည်ရှာဖွေရန်"
+                            disabled={isScanningServer}
+                          >
+                            <RefreshCw className={`w-3 h-3 ${isScanningServer ? "animate-spin" : ""}`} />
+                          </button>
+                        </div>
+
+                        {serverFiles.length > 0 ? (
+                          <div className="border border-slate-100 rounded-lg divide-y divide-slate-50 bg-slate-50/50 max-h-36 overflow-y-auto">
+                            {serverFiles.map((srv, idx) => (
+                              <div key={idx} className="p-2 flex items-center justify-between gap-1.5">
+                                <div className="min-w-0 flex-1">
+                                  <p className="text-[11px] font-medium text-slate-700 truncate" title={srv.filename}>
+                                    📄 {srv.filename}
+                                  </p>
+                                  <p className="text-[9px] text-slate-400 font-mono">
+                                    {(srv.size / 1024).toFixed(1)} KB
+                                  </p>
+                                </div>
+                                <button
+                                  onClick={() => handleLoadServerFile(srv.filename)}
+                                  disabled={isLoadingServerFile !== null}
+                                  className="text-[10px] bg-white hover:bg-indigo-50 hover:text-indigo-600 border border-slate-205 px-2 py-0.5 rounded font-bold transition-all shrink-0 cursor-pointer disabled:opacity-50"
+                                >
+                                  {isLoadingServerFile === srv.filename ? "..." : "Load"}
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="p-2.5 bg-slate-50 rounded-lg text-center border border-dashed border-slate-150">
+                            <p className="text-[9px] text-slate-400 italic">
+                              ဆာဗာ workspace root တွင် parse လုပ်ရန် .txt ဖိုင်ရှာမတွေ့ပါ။
+                            </p>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Debug parse info */}
+                      {parserDebugInfo && (
+                        <div className="bg-slate-50 p-3 rounded-lg border border-slate-100 text-[10px] text-slate-500 space-y-1">
+                          <div className="font-bold text-slate-600 text-[9px] uppercase tracking-wider">
+                            📜 Current Load Info:
+                          </div>
+                          <div>• lines: <b>{parserDebugInfo.totalLines.toLocaleString()}</b></div>
+                          <div>• index count: <b className="text-emerald-600">{parserDebugInfo.parsedCount.toLocaleString()} words</b></div>
+                        </div>
+                      )}
+                    </motion.div>
+                  )}
+
+                  {activeRightTab === "history" && (
+                    <motion.div
+                      key="history-tab"
+                      initial={{ opacity: 0, scale: 0.98 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      exit={{ opacity: 0, scale: 0.98 }}
+                      transition={{ duration: 0.15 }}
+                      className="space-y-3.5"
+                    >
+                      <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
+                        <div>
+                          <h3 className="text-xs font-bold uppercase tracking-wider text-slate-750 flex items-center gap-1.5">
+                            <History className="w-4 h-4 text-slate-500" />
+                            ယခင်ရှာဖွေမှုမှတ်တမ်း (Recent)
+                          </h3>
+                          <p className="text-[10px] text-slate-450 mt-0.5">
+                            ယခင်ဘာသာပြန်ပြီးရှာဖွေခဲ့သမျှ စာရင်းဇယားမှတ်တမ်း
+                          </p>
+                        </div>
+                        {history.length > 0 && (
+                          <button
+                            onClick={() => setHistory([])}
+                            className="text-[9px] text-rose-600 hover:text-rose-700 bg-rose-50 hover:bg-rose-100 px-1.5 py-0.5 rounded transition-all font-bold cursor-pointer"
+                          >
+                            ရှင်းလင်းရန်
+                          </button>
+                        )}
+                      </div>
+
+                      {history.length > 0 ? (
+                        <div className="space-y-2.5 divide-y divide-slate-100 max-h-72 overflow-y-auto pr-1">
+                          {history.map((hist) => (
+                            <div 
+                              key={hist.id} 
+                              className="pt-2.5 first:pt-0 cursor-pointer group"
+                              onClick={() => {
+                                setInputText(hist.originalText);
+                                setTranslationResult({
+                                  translation: hist.translation,
+                                  words: hist.words,
+                                });
+                                setSelectedWordIndex(0);
+                                setActiveRightTab("vocab");
+                              }}
+                            >
+                              <p className="text-xs font-semibold text-slate-755 group-hover:text-indigo-600 truncate">
+                                {hist.originalText}
+                              </p>
+                              <p className="text-xs text-emerald-600 truncate mt-0.5 font-medium">
+                                {hist.translation}
+                              </p>
+                              <p className="text-[9px] text-slate-400 font-mono mt-0.5">
+                                {new Date(hist.timestamp).toLocaleTimeString()}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="text-center py-10 text-slate-400">
+                          <History className="w-8 h-8 mx-auto stroke-1 mb-1 text-slate-350" />
+                          <p className="text-xs">သမိုင်းမှတ်တမ်း မရှိသေးပါ။</p>
+                        </div>
+                      )}
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+            </div>
           </section>
 
         </div>

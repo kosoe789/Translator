@@ -39,26 +39,67 @@ async function startServer() {
   // API Route: Translate text and extract words
   app.post("/api/translate", async (req, res) => {
     try {
-      const { text } = req.body;
-      if (!text || typeof text !== "string" || !text.trim()) {
-        res.status(400).json({ error: "Text is required and must be a valid non-empty string." });
+      const { text, image, mimeType } = req.body;
+      if ((!text || !text.trim()) && !image) {
+        res.status(400).json({ error: "အင်္ဂလိပ် စာသား သို့မဟုတ် ပုံတစ်ပုံ တင်ပေးရန် လိုအပ်ပါသည်။ (Text or Image is required.)" });
         return;
       }
 
-      console.log(`Translating and analyzing text: ${text.slice(0, 50)}...`);
-
       const ai = getGenAI();
-      const prompt = `Translate the following English text to clear, natural Myanmar (Burmese) language.
-Also, analyze and extract all meaningful words/vocabulary items from this text.
-EXCLUDE grammatical function words:
+      let contents: any;
+
+      if (image) {
+        console.log(`Analyzing image with mime: ${mimeType || "image/png"}...`);
+        const imagePart = {
+          inlineData: {
+            mimeType: mimeType || "image/png",
+            data: image, // base64 representation without data: prefix
+          },
+        };
+        const textPart = {
+          text: `You are an expert bilingual English to Myanmar translator and lexicographer.
+Read and analyze the English text present in this image. 
+If an English text context is provided below, use it to aid extraction:
+Text prompt: "${text || ""}"
+
+1. Extract/transcribe ALL of the visible English text from the image accurately as "extractedText".
+2. Translate the identified English text into clear, natural, and contextually precise Myanmar (Burmese) language as "translation".
+3. Extract ALL meaningful content/vocabulary words from the transcribed English text (e.g., nouns, verbs, adjectives, adverbs).
+   CRITICAL: Do NOT skip or omit any vocabulary noun, verb, adjective, or adverb. Even if a word is very common, simple, or short, it MUST be extracted! For example:
+   - Extract words like 'round', 'first', 'place', 'third', 'most', 'study', 'time', 'day', 'show', 'vote', 'ballot', 'finished', etc.
+   - Do NOT be selective. Be EXHAUSTIVE and list every single content word in chronological order as they appear in the text.
+   EXCLUDE ONLY purely grammatical function words:
+   - Articles (a, an, the)
+   - Pronouns (I, me, my, we, us, you, he, she, they, this, that, etc.)
+   - Prepositions (of, to, in, for, on, with, at, by, from, of, etc.)
+   - Conjunctions (and, but, or, nor, yet, so, because, if, etc.)
+   - Basic auxiliary/be verbs (is, am, are, was, were, be, been, do, does, did) unless they carry a unique lexical meaning.
+
+For each extracted word:
+- Provide its base/dictionary form in lowercase (e.g., 'went' -> 'go', 'studies' -> 'study', 'hopes' -> 'hope', 'finished' -> 'finish').
+- Provide its lexical part of speech (pos) (e.g., noun, verb, adjective, adverb).
+- Provide a brief, simple fallback Myanmar definition ('fallback_my') specifically tailored to how the word is used in this sentence context.
+
+Return the result strictly conforming to the requested JSON schema.`,
+        };
+        contents = { parts: [imagePart, textPart] };
+      } else {
+        console.log(`Translating and analyzing text: ${text.slice(0, 50)}...`);
+        contents = `You are an expert bilingual English to Myanmar translator and lexicographer.
+Translate the following English text to clear, natural Myanmar (Burmese) language.
+Also, analyze and extract ALL meaningful words/vocabulary items from this text.
+CRITICAL: Do NOT skip or omit any vocabulary noun, verb, adjective, or adverb. Even if a word is very common, simple, or short, it MUST be extracted! For example:
+- Extract words like 'round', 'first', 'place', 'third', 'most', 'study', 'time', 'day', 'show', 'vote', 'ballot', 'finished', etc.
+- Do NOT be selective. Be EXHAUSTIVE and list every single content word in chronological order as they appear in the text.
+EXCLUDE ONLY purely grammatical function words:
 - Articles (a, an, the)
-- Pronouns (I, me, my, we, us, you, he, she, they, this, that, etc.)
+- Pronouns (I, me, My, we, us, you, he, she, they, this, that, etc.)
 - Prepositions (of, to, in, for, on, with, at, by, from, of, etc.)
 - Conjunctions (and, but, or, nor, yet, so, because, if, etc.)
 - Basic auxiliary/be verbs (is, am, are, was, were, be, been, do, does, did) unless they carry a unique lexical meaning.
 
 For each extracted word:
-- Extract its base/dictionary form (e.g. 'studies' -> 'study', 'went' -> 'go', 'running' -> 'run', 'apples' -> 'apple').
+- Extract its base/dictionary form in lowercase (e.g., 'went' -> 'go', 'studies' -> 'study', 'hopes' -> 'hope', 'finished' -> 'finish').
 - Provide its lexical part of speech (pos) (e.g., noun, verb, adjective, adverb).
 - Provide a brief, simple fallback Myanmar definition ('fallback_my') specifically suited to how the word is used in this sentence context.
 
@@ -67,32 +108,27 @@ Input text:
 ${text}
 """
 
-Return the output as a strict JSON object with this exact shape:
-{
-  "translation": "Full Myanmar translation here",
-  "words": [
-    {
-      "original": "original word from the text",
-      "base": "its base/infinitve/dictionary form in lowercase",
-      "pos": "noun/verb/adjective/adverb etc. in lowercase",
-      "fallback_my": "simple backup translation in Myanmar"
-    }
-  ]
-}
-
-Ensure the response contains absolutely nothing except the direct JSON object.`;
+Return the output containing:
+"extractedText": output the exact input text string.
+"translation": Myanmar translation.
+"words": array of extracted words.`;
+      }
 
       const response = await ai.models.generateContent({
         model: "gemini-3.5-flash",
-        contents: prompt,
+        contents: contents,
         config: {
           responseMimeType: "application/json",
           responseSchema: {
             type: Type.OBJECT,
             properties: {
+              extractedText: {
+                type: Type.STRING,
+                description: "The transcribed/extracted English text from the image, or the original unchanged input text if no image is used.",
+              },
               translation: {
                 type: Type.STRING,
-                description: "The complete translation of the English text into Myanmar.",
+                description: "The complete natural translation of the English text into Myanmar.",
               },
               words: {
                 type: Type.ARRAY,
@@ -109,7 +145,7 @@ Ensure the response contains absolutely nothing except the direct JSON object.`;
                 },
               },
             },
-            required: ["translation", "words"],
+            required: ["extractedText", "translation", "words"],
           },
         },
       });
