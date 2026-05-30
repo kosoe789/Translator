@@ -19,7 +19,11 @@ import {
   History,
   Lock,
   Unlock,
-  Star
+  Star,
+  Settings,
+  Key,
+  Eye,
+  EyeOff
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { DictionaryEntry, WorkspaceFile, AnalyzedWord, HistoryItem } from "./types";
@@ -210,7 +214,13 @@ export default function App() {
   const [isDragging, setIsDragging] = useState(false);
 
   // Admin upload states for Server dictionary files
-  const [passcode, setPasscode] = useState("");
+  const [passcode, setPasscode] = useState<string>(() => localStorage.getItem("admin_passcode") || "");
+  
+  // Persist passcode changes to localStorage
+  useEffect(() => {
+    localStorage.setItem("admin_passcode", passcode);
+  }, [passcode]);
+
   const [isUploadingToServer, setIsUploadingToServer] = useState(false);
   const [isDeletingFromServer, setIsDeletingFromServer] = useState<string | null>(null);
   
@@ -232,7 +242,16 @@ export default function App() {
   const imageInputRef = useRef<HTMLInputElement>(null);
 
   // Tab State for right-sidebar content
-  const [activeRightTab, setActiveRightTab] = useState<"vocab" | "search" | "dict" | "history">("vocab");
+  const [activeRightTab, setActiveRightTab] = useState<"vocab" | "search" | "dict" | "history" | "settings">("vocab");
+
+  // Custom API key states
+  const [customApiKey, setCustomApiKey] = useState<string>(() => localStorage.getItem("gemini_api_key") || "");
+  const [showApiKey, setShowApiKey] = useState<boolean>(false);
+
+  // Save API key to localStorage when changed
+  useEffect(() => {
+    localStorage.setItem("gemini_api_key", customApiKey);
+  }, [customApiKey]);
 
   // Initial load: Fetch server dictionary files and check IndexedDB
   useEffect(() => {
@@ -591,11 +610,20 @@ export default function App() {
     setIsLoadingServerFile(filename);
     try {
       const response = await fetch(`/api/dictionary-file?filename=${encodeURIComponent(filename)}`);
-      if (!response.ok) {
-        const errData = await response.json();
-        throw new Error(errData.error || "ဖိုင်ကို ဖတ်၍မရပါ။");
+      
+      let data: any;
+      const contentType = response.headers.get("content-type");
+      if (contentType && contentType.includes("application/json")) {
+        data = await response.json();
+      } else {
+        const textResponse = await response.text();
+        console.error("Non-JSON Server File Response:", textResponse);
+        throw new Error(`Server response is HTML/Text instead of JSON (HTTP ${response.status})`);
       }
-      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || "ဖိုင်ကို ဖတ်၍မရပါ။");
+      }
       processDictionaryText(data.content, filename);
     } catch (err: any) {
       showError(`ဆာဗာဖိုင်ဖတ်ရန် မအောင်မြင်ပါ: ${err.message}`);
@@ -660,7 +688,16 @@ export default function App() {
               passcode: passcode.trim(),
             }),
           });
-          const data = await res.json();
+          
+          let data: any;
+          const contentType = res.headers.get("content-type");
+          if (contentType && contentType.includes("application/json")) {
+            data = await res.json();
+          } else {
+            const textResponse = await res.text();
+            throw new Error(`Server response is not JSON (HTTP ${res.status}): ${textResponse.slice(0, 50)}`);
+          }
+
           if (!res.ok) {
             throw new Error(data.error || "ဖိုင်တင်ရန် မအောင်မြင်ပါ။");
           }
@@ -704,7 +741,16 @@ export default function App() {
           passcode: passcode.trim(),
         }),
       });
-      const data = await res.json();
+      
+      let data: any;
+      const contentType = res.headers.get("content-type");
+      if (contentType && contentType.includes("application/json")) {
+        data = await res.json();
+      } else {
+        const textResponse = await res.text();
+        throw new Error(`Server response is not JSON (HTTP ${res.status}): ${textResponse.slice(0, 50)}`);
+      }
+
       if (!res.ok) {
         throw new Error(data.error || "ဖိုင်ဖျက်ရန် မအောင်မြင်ပါ။");
       }
@@ -826,16 +872,31 @@ export default function App() {
         body: JSON.stringify({ 
           text: inputText, 
           image: imageBase64,
-          mimeType: selectedImageMime
+          mimeType: selectedImageMime,
+          customApiKey: customApiKey.trim() || undefined,
+          passcode: passcode.trim() || undefined
         }),
       });
 
-      if (!response.ok) {
-        const errData = await response.json();
-        throw new Error(errData.error || "ဘာသာပြန်ယူရန် အမှားအယွင်း ဖြစ်ပေါ်ခဲ့ပါသည်။");
+      let data: any;
+      const contentType = response.headers.get("content-type");
+      if (contentType && contentType.includes("application/json")) {
+        data = await response.json();
+      } else {
+        const textResponse = await response.text();
+        console.error("Non-JSON API Error response:", textResponse);
+        if (response.status === 403) {
+          throw new Error("ဆာဗာရှိ ပင်မ API Key ကို အသုံးပြုခွင့် ကန့်သတ်ထားပါသည်။ ဆက်လက်အသုံးပြုရန် 'ဆက်တင် (Settings)' တက်ဘ်တွင် သင်၏ကိုယ်ပိုင် Gemini API Key ကို ထည့်သွင်းပေးပါ။ အကယ်၍ သင်သည် ပိုင်ရှင်ဖြစ်ပါက 'Dictionary' တက်ဘ်တွင် လျှို့ဝှက်နံပါတ် (Passcode) ကို အရင်ဆုံး ဖြည့်စွက် အတည်ပြုပေးပါ။");
+        } else if (response.status === 404) {
+          throw new Error(`ဘာသာပြန် စနစ် (API Route) ကို ဆာဗာပေါ်တွင် ရှာမတွေ့ပါ။ ဆာဗာတွင် ပြဿနာ ရှိနေပါသဖြင့် ခေတ္တစောင့်ပြီးမှ ထပ်စမ်းကြည့်ပါ။ (HTTP 404)`);
+        } else {
+          throw new Error(`ဆာဗာမှ ပြန်လည်ဖြေကြားချက်သည် JSON ပုံစံမဟုတ်ဘဲ လွဲမှားနေပါသည် (HTTP ${response.status})။`);
+        }
       }
 
-      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || "ဘာသာပြန်ယူရန် အမှားအယွင်း ဖြစ်ပေါ်ခဲ့ပါသည်။");
+      }
       
       // If extractedText is returned and we used an image, update input text so they can see/edit it
       if (data.extractedText && selectedImage) {
@@ -1179,7 +1240,7 @@ export default function App() {
               <div className="flex border-b border-slate-100 bg-slate-50/60 p-1.5 gap-1 overflow-x-auto scroller-hide">
                 <button
                   onClick={() => setActiveRightTab("vocab")}
-                  className={`flex items-center gap-1.5 px-3 py-2 text-xs font-bold rounded-lg transition-all whitespace-nowrap cursor-pointer flex-1 justify-center ${
+                  className={`flex items-center gap-1.5 px-2.5 py-2 text-xs font-bold rounded-lg transition-all whitespace-nowrap cursor-pointer flex-1 justify-center ${
                     activeRightTab === "vocab"
                       ? "bg-white text-indigo-600 shadow-2xs border border-indigo-100"
                       : "text-slate-500 hover:text-slate-800 hover:bg-white/40"
@@ -1190,7 +1251,7 @@ export default function App() {
                 </button>
                 <button
                   onClick={() => setActiveRightTab("search")}
-                  className={`flex items-center gap-1.5 px-3 py-2 text-xs font-bold rounded-lg transition-all whitespace-nowrap cursor-pointer flex-1 justify-center ${
+                  className={`flex items-center gap-1.5 px-2.5 py-2 text-xs font-bold rounded-lg transition-all whitespace-nowrap cursor-pointer flex-1 justify-center ${
                     activeRightTab === "search"
                       ? "bg-white text-indigo-600 shadow-2xs border border-indigo-100"
                       : "text-slate-500 hover:text-slate-800 hover:bg-white/40"
@@ -1201,7 +1262,7 @@ export default function App() {
                 </button>
                 <button
                   onClick={() => setActiveRightTab("dict")}
-                  className={`flex items-center gap-1.5 px-3 py-2 text-xs font-bold rounded-lg transition-all whitespace-nowrap cursor-pointer flex-1 justify-center ${
+                  className={`flex items-center gap-1.5 px-2.5 py-2 text-xs font-bold rounded-lg transition-all whitespace-nowrap cursor-pointer flex-1 justify-center ${
                     activeRightTab === "dict"
                       ? "bg-white text-indigo-600 shadow-2xs border border-indigo-100"
                       : "text-slate-500 hover:text-slate-800 hover:bg-white/40"
@@ -1212,7 +1273,7 @@ export default function App() {
                 </button>
                 <button
                   onClick={() => setActiveRightTab("history")}
-                  className={`flex items-center gap-1.5 px-3 py-2 text-xs font-bold rounded-lg transition-all whitespace-nowrap cursor-pointer flex-1 justify-center ${
+                  className={`flex items-center gap-1.5 px-2.5 py-2 text-xs font-bold rounded-lg transition-all whitespace-nowrap cursor-pointer flex-1 justify-center ${
                     activeRightTab === "history"
                       ? "bg-white text-indigo-600 shadow-2xs border border-indigo-100"
                       : "text-slate-500 hover:text-slate-800 hover:bg-white/40"
@@ -1220,6 +1281,18 @@ export default function App() {
                 >
                   <History className="w-3.5 h-3.5" />
                   မှတ်တမ်း {history.length > 0 ? `(${history.length})` : ""}
+                </button>
+                <button
+                  onClick={() => setActiveRightTab("settings")}
+                  className={`flex items-center gap-1.5 px-2.5 py-2 text-xs font-bold rounded-lg transition-all whitespace-nowrap cursor-pointer flex-1 justify-center ${
+                    activeRightTab === "settings"
+                      ? "bg-white text-indigo-600 shadow-2xs border border-indigo-100"
+                      : "text-slate-500 hover:text-slate-800 hover:bg-white/40"
+                  }`}
+                  title="Gemini API Key သတ်မှတ်ပြင်ဆင်ရန်"
+                >
+                  <Settings className="w-3.5 h-3.5" />
+                  ဆက်တင်
                 </button>
               </div>
 
@@ -1753,6 +1826,112 @@ export default function App() {
                           <History className="w-8 h-8 mx-auto stroke-1 mb-1 text-slate-350" />
                           <p className="text-xs">သမိုင်းမှတ်တမ်း မရှိသေးပါ။</p>
                         </div>
+                      )}
+                    </motion.div>
+                  )}
+
+                  {activeRightTab === "settings" && (
+                    <motion.div
+                      key="settings-tab"
+                      initial={{ opacity: 0, scale: 0.98 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      exit={{ opacity: 0, scale: 0.98 }}
+                      transition={{ duration: 0.15 }}
+                      className="space-y-4"
+                    >
+                      <div className="border-b border-slate-100 pb-2.5">
+                        <h3 className="text-xs font-bold uppercase tracking-wider text-slate-755 flex items-center gap-1.5">
+                          <Settings className="w-4 h-4 text-indigo-600" />
+                          Gemini API Key ဆက်တင်များ
+                        </h3>
+                        <p className="text-[10px] text-slate-450 mt-0.5">
+                          အဖွဲ့ဝင်များ၊ အခြားသူများအား မျှဝေအသုံးပြုသည့်အခါ ၎င်းတို့၏ ကိုယ်ပိုင် API Key အသုံးပြုနိုင်ရေး။
+                        </p>
+                      </div>
+
+                      <div className="space-y-3 bg-slate-50/60 p-3.5 rounded-xl border border-slate-100">
+                        <div className="text-[11px] leading-relaxed text-slate-650 space-y-2">
+                          <p>
+                            💡 <b>လုံခြုံရေး စနစ်သစ်:</b> ဆာဗာရှိ ပင်မ API Key ကို ပိုင်ရှင်ဖြစ်သူ သင်ကိုယ်တိုင်အတွက်သာ (လုံခြုံစိတ်ချစွာ) သီးသန့် ကန့်သတ်ထားပါသည်။
+                          </p>
+                          <p>
+                            • အခြားသူများအား မျှဝေအသုံးပြုသည့်အခါ ၎င်းတို့ကိုယ်ပိုင် <b>Gemini API Key</b> ကို ဤနေရာတွင် ထည့်သွင်းသုံးစွဲရမည် ဖြစ်ပါသည်။
+                          </p>
+                          <p>
+                            • သင်ကိုယ်တိုင် (ပိုင်ရှင်) အသုံးပြုရန်အတွက် <b>'Dictionary'</b> တက်ဘ်တွင် ပျက်ကွက်မရှိ ဖြည့်စွက်ထားသော လျှို့ဝှက်နံပါတ် (Passcode) အား အသုံးပြု၍ ဆာဗာ၏ ပင်မ API Key ကို သုံးနိုင်ပါသည်။ (သင့် Browser တွင် Passcode အား စနစ်တကျ အမြဲတမ်းအလိုအလျောက် စိတ်ချစွာ မှတ်မိပေးထားပါသည်)
+                          </p>
+                          <p className="text-[10px] text-indigo-650 font-medium">
+                            🔒 <b>ဒေတာ လုံခြုံရေး:</b> ဤနေရာ၌ ဖြည့်စွက်လိုက်သော API Key များသည် သင့်စက်၏ Browser LocalStorage ထဲတွင်သာ လုံခြုံစွာ သိမ်းဆည်းမည်ဖြစ်ပြီး မည်သည့် ဆာဗာ သို့မဟုတ် တခြားသူဆီသို့မျှ လုံးဝမရောက်ရှိပါ။
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="space-y-2">
+                        <div className="flex justify-between items-center">
+                          <label className="block text-[10px] font-bold text-slate-700 uppercase tracking-wide">
+                            ဧည့်သည် / အဖွဲ့ဝင်များ၏ ကိုယ်ပိုင် Gemini API Key
+                          </label>
+                          {customApiKey.trim() && (
+                            <span className="text-[9px] font-bold text-emerald-600 bg-emerald-50 border border-emerald-100/60 px-2 py-0.5 rounded-md flex items-center gap-1 animate-pulse">
+                              ✓ Auto-Saved (စနစ်တကျသိမ်းပြီး)
+                            </span>
+                          )}
+                        </div>
+                        <div className="relative rounded-md shadow-xs">
+                          <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3">
+                            <Key className="h-3.5 w-3.5 text-slate-400" aria-hidden="true" />
+                          </div>
+                          <input
+                            type={showApiKey ? "text" : "password"}
+                            value={customApiKey}
+                            onChange={(e) => setCustomApiKey(e.target.value)}
+                            className="block w-full rounded-lg border border-slate-200 bg-white py-2 pl-9 pr-10 text-xs text-slate-800 placeholder-slate-400 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 font-mono transition-all outline-hidden"
+                            placeholder="AIzaSy..."
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setShowApiKey(!showApiKey)}
+                            className="absolute inset-y-0 right-0 flex items-center pr-3 text-slate-400 hover:text-slate-600 cursor-pointer"
+                          >
+                            {showApiKey ? (
+                              <EyeOff className="h-3.5 w-3.5" />
+                            ) : (
+                              <Eye className="h-3.5 w-3.5" />
+                            )}
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="pt-2">
+                        {customApiKey.trim() ? (
+                          <div className="flex items-center gap-1.5 bg-emerald-50 text-emerald-700 border border-emerald-100 p-2.5 rounded-lg text-[10px] font-medium">
+                            <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" />
+                            <span>အသုံးပြုနေသောစနစ်: <b>ကိုယ်ပိုင် API Key (Custom User Key)</b> ကို အသုံးပြုပြီး Gemini ဖြင့် ချိတ်ဆက်လုပ်ဆောင်ပါမည်။</span>
+                          </div>
+                        ) : passcode.trim() ? (
+                          <div className="flex items-center gap-1.5 bg-emerald-50 text-emerald-700 border border-emerald-100 p-2.5 rounded-lg text-[10px] font-medium">
+                            <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0 animate-pulse" />
+                            <span>အသုံးပြုနေသောစနစ်: ပိုင်ရှင်ဖြစ်ကြောင်း အတည်ပြုပြီးသဖြင့် ဆာဗာ၏ <b>Default Server Key</b> ဖြင့် အဆင်ပြေပြေ ဘာသာပြန်အလုပ်လုပ်နေပါသည်။</span>
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-1.5 bg-rose-50 text-rose-700 border border-rose-100 p-2.5 rounded-lg text-[10px] font-medium">
+                            <div className="w-1.5 h-1.5 rounded-full bg-rose-500 shrink-0 animate-pulse" />
+                            <span>အသုံးပြုနေသောစနစ်: <b>API Key သို့မဟုတ် Passcode လိုအပ်ပါသည်</b> (အခြားသူများ ဆက်လက် ဘာသာပြန်ရန်အတွက် ကိုယ်ပိုင် Gemini API Key ဖြည့်သွင်းပေးရန် လိုအပ်ပါသည်)</span>
+                          </div>
+                        )}
+                      </div>
+
+                      {customApiKey.trim() && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setCustomApiKey("");
+                            showSuccess("ကိုယ်ပိုင် API Key ကို စနစ်အတွင်းမှ ရှင်းလင်းလိုက်ပါပြီ။ ဆာဗာ၏ မူလစနစ်ဖြင့် ပြန်လည်အလုပ်လုပ်ပါမည်။");
+                          }}
+                          className="w-full text-[10px] bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-100/60 py-1.5 px-3 rounded-lg font-bold transition-all cursor-pointer flex items-center justify-center gap-1"
+                        >
+                          Clear Custom API Key
+                        </button>
                       )}
                     </motion.div>
                   )}

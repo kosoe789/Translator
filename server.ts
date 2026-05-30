@@ -8,16 +8,27 @@ import dotenv from "dotenv";
 // Load environment variables
 dotenv.config();
 
-// Lazy-initialized Gemini client
-let genAI: GoogleGenAI | null = null;
+// Lazy-initialized fallback Gemini client
+let fallbackGenAI: GoogleGenAI | null = null;
 
-function getGenAI(): GoogleGenAI {
-  if (!genAI) {
+function getGenAIClient(customApiKey?: string): GoogleGenAI {
+  if (customApiKey && customApiKey.trim()) {
+    return new GoogleGenAI({
+      apiKey: customApiKey.trim(),
+      httpOptions: {
+        headers: {
+          "User-Agent": "aistudio-build",
+        },
+      },
+    });
+  }
+
+  if (!fallbackGenAI) {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
-      throw new Error("GEMINI_API_KEY environment variable is not set. Please set it in Settings > Secrets.");
+      throw new Error("GEMINI_API_KEY environment variable is not set on the server, and no custom API Key is provided in settings.");
     }
-    genAI = new GoogleGenAI({
+    fallbackGenAI = new GoogleGenAI({
       apiKey,
       httpOptions: {
         headers: {
@@ -26,7 +37,7 @@ function getGenAI(): GoogleGenAI {
       },
     });
   }
-  return genAI;
+  return fallbackGenAI;
 }
 
 async function startServer() {
@@ -39,13 +50,25 @@ async function startServer() {
   // API Route: Translate text and extract words
   app.post("/api/translate", async (req, res) => {
     try {
-      const { text, image, mimeType } = req.body;
+      const { text, image, mimeType, customApiKey, passcode } = req.body;
       if ((!text || !text.trim()) && !image) {
         res.status(400).json({ error: "အင်္ဂလိပ် စာသား သို့မဟုတ် ပုံတစ်ပုံ တင်ပေးရန် လိုအပ်ပါသည်။ (Text or Image is required.)" });
         return;
       }
 
-      const ai = getGenAI();
+      // If no custom API key is provided, restrict the default server API key to the owner (with valid passcode)
+      const isCustomKeyProvided = !!(customApiKey && customApiKey.trim());
+      if (!isCustomKeyProvided) {
+        const adminPasscode = process.env.ADMIN_UPLOAD_PASSCODE || "admin123";
+        if (!passcode || passcode.trim() !== adminPasscode) {
+          res.status(403).json({ 
+            error: "ဆာဗာရှိ ပင်မ API Key ကို အသုံးပြုခွင့် ကန့်သတ်ထားပါသည်။ ဆက်လက်အသုံးပြုရန် 'ဆက်တင် (Settings)' တက်ဘ်တွင် သင်၏ကိုယ်ပိုင် Gemini API Key ကို ထည့်သွင်းပေးပါ။ အကယ်၍ သင်သည် ပိုင်ရှင်ဖြစ်ပါက 'Dictionary' တက်ဘ်တွင် လျှို့ဝှက်နံပါတ် (Passcode) ကို အရင်ဆုံး ဖြည့်စွက် အတည်ပြုပေးပါ။" 
+          });
+          return;
+        }
+      }
+
+      const ai = getGenAIClient(customApiKey);
       let contents: any;
 
       if (image) {
