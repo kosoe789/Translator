@@ -23,7 +23,8 @@ import {
   Settings,
   Key,
   Eye,
-  EyeOff
+  EyeOff,
+  Clipboard
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { DictionaryEntry, WorkspaceFile, AnalyzedWord, HistoryItem } from "./types";
@@ -242,7 +243,7 @@ export default function App() {
   const imageInputRef = useRef<HTMLInputElement>(null);
 
   // Tab State for right-sidebar content
-  const [activeRightTab, setActiveRightTab] = useState<"vocab" | "search" | "dict" | "history" | "settings">("vocab");
+  const [activeRightTab, setActiveRightTab] = useState<"vocab" | "search" | "bookmarks" | "history" | "settings">("vocab");
 
   // Custom API key states
   const [customApiKey, setCustomApiKey] = useState<string>(() => localStorage.getItem("gemini_api_key") || "");
@@ -263,6 +264,8 @@ export default function App() {
           setDictionarySource("user_file");
           setLoadedFileName("IndexedDB Cache");
           showSuccess(`Loaded saved dictionary containing ${savedMap.size.toLocaleString()} words.`);
+          // Just scan the files
+          scanServerFiles();
         } else {
           // Initialize with Sample Dictionary
           const initialMap = new Map<string, string>();
@@ -271,6 +274,14 @@ export default function App() {
           });
           setDictionaryMap(initialMap);
           setDictionarySource("sample");
+          
+          // Since cache is empty, scan files and auto-trigger load for eng-myan.txt if found
+          scanServerFiles().then((files) => {
+            const hasEngMyan = files.find((f) => f.filename === "eng-myan.txt");
+            if (hasEngMyan) {
+              handleLoadServerFile("eng-myan.txt");
+            }
+          });
         }
       })
       .catch((err) => {
@@ -281,10 +292,13 @@ export default function App() {
           initialMap.set(word, def);
         });
         setDictionaryMap(initialMap);
+        scanServerFiles().then((files) => {
+          const hasEngMyan = files.find((f) => f.filename === "eng-myan.txt");
+          if (hasEngMyan) {
+            handleLoadServerFile("eng-myan.txt");
+          }
+        });
       });
-
-    // 2. Scan server folder for dictionary .txt files
-    scanServerFiles();
   }, []);
 
   // Update single search lookup when query changes
@@ -314,15 +328,18 @@ export default function App() {
   };
 
   // Helper function to scan server files
-  const scanServerFiles = async () => {
+  const scanServerFiles = async (): Promise<WorkspaceFile[]> => {
     setIsScanningServer(true);
     try {
       const res = await fetch("/api/dictionary-files");
       if (!res.ok) throw new Error("Could not list server files.");
       const data = await res.json();
-      setServerFiles(data.files || []);
+      const files = data.files || [];
+      setServerFiles(files);
+      return files;
     } catch (err: any) {
       console.error(err);
+      return [];
     } finally {
       setIsScanningServer(false);
     }
@@ -864,38 +881,95 @@ export default function App() {
       }
     }
 
-    try {
-      // Connect to server api
-      const response = await fetch("/api/translate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
-          text: inputText, 
-          image: imageBase64,
-          mimeType: selectedImageMime,
-          customApiKey: customApiKey.trim() || undefined,
-          passcode: passcode.trim() || undefined
-        }),
-      });
+    const sanitizedText = inputText
+      .replace(/[\u2018\u2019]/g, "'") // Left and right curly single quotes -> straight single quote
+      .replace(/[\u201C\u201D]/g, '"') // Left and right curly double quotes -> straight double quote
+      .replace(/\u2026/g, "...");     // Ellipsis (...) -> three dots
 
+    // Keep the on-screen input text synchronized with the sanitized text
+    if (sanitizedText !== inputText) {
+      setInputText(sanitizedText);
+    }
+
+    try {
+      // Connect to server api with automatic retry to handle gateway cold starts and temporary proxy errors
       let data: any;
-      const contentType = response.headers.get("content-type");
-      if (contentType && contentType.includes("application/json")) {
-        data = await response.json();
-      } else {
-        const textResponse = await response.text();
-        console.error("Non-JSON API Error response:", textResponse);
-        if (response.status === 403) {
-          throw new Error("ဆာဗာရှိ ပင်မ API Key ကို အသုံးပြုခွင့် ကန့်သတ်ထားပါသည်။ ဆက်လက်အသုံးပြုရန် 'ဆက်တင် (Settings)' တက်ဘ်တွင် သင်၏ကိုယ်ပိုင် Gemini API Key ကို ထည့်သွင်းပေးပါ။ အကယ်၍ သင်သည် ပိုင်ရှင်ဖြစ်ပါက 'Dictionary' တက်ဘ်တွင် လျှို့ဝှက်နံပါတ် (Passcode) ကို အရင်ဆုံး ဖြည့်စွက် အတည်ပြုပေးပါ။");
-        } else if (response.status === 404) {
-          throw new Error(`ဘာသာပြန် စနစ် (API Route) ကို ဆာဗာပေါ်တွင် ရှာမတွေ့ပါ။ ဆာဗာတွင် ပြဿနာ ရှိနေပါသဖြင့် ခေတ္တစောင့်ပြီးမှ ထပ်စမ်းကြည့်ပါ။ (HTTP 404)`);
-        } else {
-          throw new Error(`ဆာဗာမှ ပြန်လည်ဖြေကြားချက်သည် JSON ပုံစံမဟုတ်ဘဲ လွဲမှားနေပါသည် (HTTP ${response.status})။`);
+      let response: Response | null = null;
+      let attempts = 0;
+      const maxAttempts = 3;
+      let success = false;
+
+      while (attempts < maxAttempts && !success) {
+        attempts++;
+        try {
+          response = await fetch("/api/translate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ 
+              text: sanitizedText, 
+              image: imageBase64,
+              mimeType: selectedImageMime,
+              customApiKey: customApiKey.trim() || undefined,
+              passcode: passcode.trim() || undefined
+            }),
+          });
+
+          const contentType = response?.headers?.get("content-type");
+          const responseText = await response.text().catch(() => "");
+
+          if (contentType && contentType.includes("application/json")) {
+            try {
+              data = JSON.parse(responseText.trim());
+              if (data && data.error) {
+                throw new Error(data.error);
+              }
+              success = true;
+            } catch (jsonErr: any) {
+              console.warn(`Attempt ${attempts} failed to parse JSON from body:`, jsonErr);
+              if (attempts >= maxAttempts) {
+                if (response.status === 403) {
+                  throw new Error("ဆာဗာရှိ ပင်မ API Key ကို အသုံးပြုခွင့် ကန့်သတ်ထားပါသည်။ ဆက်လက်အသုံးပြုရန် 'ဆက်တင် (Settings)' တက်ဘ်တွင် သင်၏ကိုယ်ပိုင် Gemini API Key ကို ထည့်သွင်းပေးပါ။ အကယ်၍ သင်သည် ပိုင်ရှင်ဖြစ်ပါက 'Dictionary' တက်ဘ်တွင် လျှို့ဝှက်နံပါတ် (Passcode) ကို အရင်ဆုံး ဖြည့်စွက် အတည်ပြုပေးပါ။");
+                }
+                if (response.status === 404) {
+                  throw new Error(`ဘာသာပြန် စနစ် (API Route) ကို ဆာဗာပေါ်တွင် ရှာမတွေ့ပါ။ ဆာဗာတွင် ပြဿနာ ရှိနေပါသဖြင့် ခေတ္တစောင့်ပြီးမှ ထပ်စမ်းကြည့်ပါ။ (HTTP 404)`);
+                } else {
+                  throw new Error(`ဆာဗာမှ ပြန်လည်ဖြေကြားချက်သည် JSON ပုံစံမဟုတ်ဘဲ လွဲမှားနေပါသည် (HTTP ${response.status})။`);
+                }
+              }
+              // Wait slightly before retrying (1000ms)
+              await new Promise((resolve) => setTimeout(resolve, 1000));
+            }
+          } else {
+            console.warn(`Attempt ${attempts} returned non-JSON response:`, responseText.slice(0, 150));
+            
+            if (response.status === 403) {
+              throw new Error("ဆာဗာရှိ ပင်မ API Key ကို အသုံးပြုခွင့် ကန့်သတ်ထားပါသည်။ ဆက်လက်အသုံးပြုရန် 'ဆက်တင် (Settings)' တက်ဘ်တွင် သင်၏ကိုယ်ပိုင် Gemini API Key ကို ထည့်သွင်းပေးပါ။ အကယ်၍ သင်သည် ပိုင်ရှင်ဖြစ်ပါက 'Dictionary' တက်ဘ်တွင် လျှို့ဝှက်နံပါတ် (Passcode) ကို အရင်ဆုံး ဖြည့်စွက် အတည်ပြုပေးပါ။");
+            }
+
+            if (attempts < maxAttempts) {
+              // Wait slightly before retrying (1000ms)
+              await new Promise((resolve) => setTimeout(resolve, 1000));
+              continue;
+            }
+
+            if (response.status === 404) {
+              throw new Error(`ဘာသာပြန် စနစ် (API Route) ကို ဆာဗာပေါ်တွင် ရှာမတွေ့ပါ။ ဆာဗာတွင် ပြဿနာ ရှိနေပါသဖြင့် ခေတ္တစောင့်ပြီးမှ ထပ်စမ်းကြည့်ပါ။ (HTTP 404)`);
+            } else {
+              throw new Error(`ဆာဗာမှ ပြန်လည်ဖြေကြားချက်သည် JSON ပုံစံမဟုတ်ဘဲ လွဲမှားနေပါသည် (HTTP ${response.status})။`);
+            }
+          }
+        } catch (fetchErr: any) {
+          console.error(`Attempt ${attempts} failed with error:`, fetchErr);
+          if (attempts >= maxAttempts) {
+            throw fetchErr;
+          }
+          // Wait slightly before retrying (1000ms)
+          await new Promise((resolve) => setTimeout(resolve, 1000));
         }
       }
 
-      if (!response.ok) {
-        throw new Error(data.error || "ဘာသာပြန်ယူရန် အမှားအယွင်း ဖြစ်ပေါ်ခဲ့ပါသည်။");
+      if (!response || !response.ok) {
+        throw new Error(data?.error || "ဘာသာပြန်ယူရန် အမှားအယွင်း ဖြစ်ပေါ်ခဲ့ပါသည်။");
       }
       
       // If extractedText is returned and we used an image, update input text so they can see/edit it
@@ -1011,7 +1085,7 @@ export default function App() {
   // Language helper translations (Burmese is default, but clean bilingual captions are used)
   return (
     <div className="min-h-screen bg-[#F8FAFC]">
-      <main className="max-w-6xl mx-auto px-4 py-8">
+      <main className="max-w-full mx-auto px-4 md:px-8 lg:px-12 py-8">
         
         {/* International-Standard Premium Header Banner */}
         <div className="mb-8 relative overflow-hidden rounded-2xl border border-slate-900/10 bg-gradient-to-r from-slate-900 via-indigo-950 to-slate-900 shadow-xl py-8 px-8 flex items-center justify-center text-center">
@@ -1065,16 +1139,43 @@ export default function App() {
                 <div className="flex items-center gap-2 text-sm font-semibold text-indigo-600">
                   <Sparkles className="w-4 h-4 text-indigo-500" />
                 </div>
-                <button
-                  onClick={() => {
-                    setInputText("");
-                    handleRemoveImage();
-                  }}
-                  className="text-xs text-slate-400 hover:text-rose-600 transition-colors py-1 px-2.5 rounded hover:bg-rose-50 font-medium cursor-pointer"
-                  disabled={isTranslating}
-                >
-                  အကုန်ဖျက်ရန်
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        if (!navigator.clipboard || !navigator.clipboard.readText) {
+                          throw new Error("Clipboard API not supported");
+                        }
+                        const text = await navigator.clipboard.readText();
+                        if (text && text.trim()) {
+                          setInputText(text);
+                          showSuccess("ကူးယူထားသော စာသားကို အောင်မြင်စွာ ထည့်သွင်းပြီးပါပြီ။");
+                        } else {
+                          showError("ကူးယူထားသော စာသား မရှိပါ။ ရှေးဦးစွာ စာသားတစ်ခုခုကို Copy ကူးယူထားပေးပါ။");
+                        }
+                      } catch (err: any) {
+                        showError("Clipboard ဖတ်ခွင့်ကို iFrame ကြောင့် ကန့်သတ်ထားပါသည်။ စာရိုက်ကွက်ထဲတွင် Keyboard မှ Ctrl+V သုံး၍လည်းကောင်း၊ ဖုန်းမှ Paste ကို ကိုယ်တိုင် နှိပ်ပြီးလည်းကောင်း ထည့်သွင်းနိုင်ပါသည်။");
+                      }
+                    }}
+                    className="text-xs text-indigo-600 hover:text-indigo-800 hover:bg-indigo-50 transition-colors py-1 px-2.5 rounded font-semibold cursor-pointer flex items-center gap-1 border border-slate-100 bg-slate-50/50"
+                    disabled={isTranslating}
+                    title="Paste from clipboard"
+                  >
+                    <Clipboard className="w-3.5 h-3.5" />
+                    စာသားကူးထည့်ရန် (Paste)
+                  </button>
+                  <button
+                    onClick={() => {
+                      setInputText("");
+                      handleRemoveImage();
+                    }}
+                    className="text-xs text-slate-400 hover:text-rose-600 transition-colors py-1 px-2.5 rounded hover:bg-rose-50 font-medium cursor-pointer"
+                    disabled={isTranslating}
+                  >
+                    ရှိပြီးစာဖျက်ရန်
+                  </button>
+                </div>
               </div>
 
               <textarea
@@ -1138,32 +1239,9 @@ export default function App() {
                 </div>
               )}
 
-              {/* Sample helper sentences clickers */}
-              <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-slate-50 pt-3">
-                <span className="text-xs text-slate-400 flex items-center gap-1">
-                  <HelpCircle className="w-3.5 h-3.5" />
-                  စမ်းသပ်ရန် စာကြောင်းများ:
-                </span>
-                
-                <button
-                  type="button"
-                  onClick={() => loadTestSentence("A quick brown fox jumps over the lazy dog.")}
-                  className="text-xs px-3 py-1.5 bg-slate-50 border border-slate-200 hover:border-indigo-200 hover:bg-indigo-50 hover:text-indigo-600 text-slate-600 rounded-lg transition-all"
-                  title="A classic sentence with all alphabets"
-                >
-                  🦊 Black Fox jump
-                </button>
-                <button
-                  type="button"
-                  onClick={() => loadTestSentence("Studies show studies improve vocabulary.")}
-                  className="text-xs px-3 py-1.5 bg-slate-50 border border-slate-200 hover:border-indigo-200 hover:bg-indigo-50 hover:text-indigo-600 text-slate-600 rounded-lg transition-all"
-                >
-                  📖 Studies vocabulary
-                </button>
-              </div>
 
               {/* Perform translator CTA */}
-              <div className="mt-6 flex justify-end">
+              <div className="mt-6 flex justify-center">
                 <button
                   onClick={handleTranslateAndProcess}
                   disabled={isTranslating}
@@ -1250,6 +1328,18 @@ export default function App() {
                   ဝေါဟာရများ {translationResult ? `(${translationResult.words.length})` : ""}
                 </button>
                 <button
+                  onClick={() => setActiveRightTab("settings")}
+                  className={`flex items-center gap-1.5 px-2.5 py-2 text-xs font-bold rounded-lg transition-all whitespace-nowrap cursor-pointer flex-1 justify-center ${
+                    activeRightTab === "settings"
+                      ? "bg-white text-indigo-600 shadow-2xs border border-indigo-100"
+                      : "text-slate-500 hover:text-slate-800 hover:bg-white/40"
+                  }`}
+                  title="အသုံးပြုနည်း လမ်းညွှန်ချက်များ"
+                >
+                  <HelpCircle className="w-3.5 h-3.5" />
+                  အသုံးပြုနည်း
+                </button>
+                <button
                   onClick={() => setActiveRightTab("search")}
                   className={`flex items-center gap-1.5 px-2.5 py-2 text-xs font-bold rounded-lg transition-all whitespace-nowrap cursor-pointer flex-1 justify-center ${
                     activeRightTab === "search"
@@ -1258,18 +1348,18 @@ export default function App() {
                   }`}
                 >
                   <Search className="w-3.5 h-3.5" />
-                  အဘိဓာန်ရှာဖွေမှု
+                  စာရှာရန်
                 </button>
                 <button
-                  onClick={() => setActiveRightTab("dict")}
+                  onClick={() => setActiveRightTab("bookmarks")}
                   className={`flex items-center gap-1.5 px-2.5 py-2 text-xs font-bold rounded-lg transition-all whitespace-nowrap cursor-pointer flex-1 justify-center ${
-                    activeRightTab === "dict"
+                    activeRightTab === "bookmarks"
                       ? "bg-white text-indigo-600 shadow-2xs border border-indigo-100"
                       : "text-slate-500 hover:text-slate-800 hover:bg-white/40"
                   }`}
                 >
-                  <Upload className="w-3.5 h-3.5" />
-                  ဖိုင်တင်ရန်
+                  <Star className="w-3.5 h-3.5" />
+                  စာမှတ် {history.filter(item => item.isBookmarked).length > 0 ? `(${history.filter(item => item.isBookmarked).length})` : ""}
                 </button>
                 <button
                   onClick={() => setActiveRightTab("history")}
@@ -1281,18 +1371,6 @@ export default function App() {
                 >
                   <History className="w-3.5 h-3.5" />
                   မှတ်တမ်း {history.length > 0 ? `(${history.length})` : ""}
-                </button>
-                <button
-                  onClick={() => setActiveRightTab("settings")}
-                  className={`flex items-center gap-1.5 px-2.5 py-2 text-xs font-bold rounded-lg transition-all whitespace-nowrap cursor-pointer flex-1 justify-center ${
-                    activeRightTab === "settings"
-                      ? "bg-white text-indigo-600 shadow-2xs border border-indigo-100"
-                      : "text-slate-500 hover:text-slate-800 hover:bg-white/40"
-                  }`}
-                  title="Gemini API Key သတ်မှတ်ပြင်ဆင်ရန်"
-                >
-                  <Settings className="w-3.5 h-3.5" />
-                  ဆက်တင်
                 </button>
               </div>
 
@@ -1312,15 +1390,15 @@ export default function App() {
                         <div className="space-y-4">
                           <div className="flex items-center justify-between border-b border-slate-100 pb-3">
                             <div>
-                              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-700 flex items-center gap-1.5">
+                              <h3 className="text-sm font-extrabold uppercase tracking-wider text-indigo-700 flex items-center gap-1.5">
                                 <BookMarked className="w-4 h-4 text-indigo-500" />
                                 ဝေါဟာရနှင့် ဖွင့်ဆိုချက်များ
                               </h3>
-                              <p className="text-[10px] text-slate-400 mt-0.5">
+                              <p className="text-[11px] text-emerald-600 font-semibold mt-0.5">
                                 ဝိဘတ်၊ နာမ်စား၊ အာတီကယ်များ ချန်လှပ်၍ တိုက်ဆိုင်ရှာဖွေမှု
                               </p>
                             </div>
-                            <span className="text-[10px] font-sans px-2.5 py-0.5 bg-indigo-50 border border-indigo-100 text-indigo-650 rounded-full font-bold">
+                            <span className="text-[10px] font-sans px-2.5 py-0.5 bg-rose-50 border border-rose-200 text-rose-600 rounded-full font-extrabold">
                               {translationResult.words.length} Words Traced
                             </span>
                           </div>
@@ -1329,7 +1407,7 @@ export default function App() {
                           <div className="bg-indigo-50/50 p-3 rounded-xl border border-indigo-100/60 flex flex-col gap-1.5 shadow-3xs">
                             <label className="text-xs font-bold text-indigo-950 flex items-center gap-1" htmlFor="traced-words-select-sb">
                               <BookOpen className="w-3.5 h-3.5 text-indigo-600" />
-                              စကားလုံး ရွေးချယ်ရန် (Select Traced Word):
+                              စကားလုံး ရွေးချယ်ရန်:
                             </label>
                             <select
                               id="traced-words-select-sb"
@@ -1462,23 +1540,13 @@ export default function App() {
                       transition={{ duration: 0.15 }}
                       className="space-y-4"
                     >
-                      <div className="border-b border-slate-100 pb-2.5">
-                        <h3 className="text-xs font-bold uppercase tracking-wider text-slate-750 flex items-center gap-1.5">
-                          <Search className="w-4 h-4 text-slate-500" />
-                          အဘိဓာန်အမြန်ရှာ (Single Word Search)
-                        </h3>
-                        <p className="text-[10px] text-slate-400 mt-0.5">
-                          ဒေတာဘေ့စ်ထဲမှ စကားလုံးတစ်လုံးချင်းစီကို တိုက်ရိုက် ရှာဖွေနိုင်သည့်အကွက်
-                        </p>
-                      </div>
-
                       <div className="relative">
                         <input
                           type="text"
                           value={searchQuery}
                           onChange={(e) => setSearchQuery(e.target.value)}
-                          placeholder="learn, dictionary, code, test..."
-                          className="w-full text-xs pl-9 pr-4 py-2 rounded-xl border border-slate-200 text-slate-800 focus:outline-hidden focus:ring-1 focus:ring-indigo-500 placeholder-slate-400"
+                          placeholder="အဘိဓာန်မှာ စာလုံးရှာမည်။"
+                          className="w-full text-xs pl-9 pr-4 py-2 rounded-xl border border-slate-200 text-slate-805 focus:outline-hidden focus:ring-1 focus:ring-indigo-500 placeholder-slate-400 font-medium"
                         />
                         <div className="absolute left-3.5 top-2.5 text-slate-400">
                           <Search className="w-3.5 h-3.5" />
@@ -1505,202 +1573,95 @@ export default function App() {
                     </motion.div>
                   )}
 
-                  {activeRightTab === "dict" && (
+                  {activeRightTab === "bookmarks" && (
                     <motion.div
-                      key="dict-tab"
+                      key="bookmarks-tab"
                       initial={{ opacity: 0, scale: 0.98 }}
                       animate={{ opacity: 1, scale: 1 }}
                       exit={{ opacity: 0, scale: 0.98 }}
                       transition={{ duration: 0.15 }}
-                      className="space-y-4"
+                      className="space-y-3.5"
                     >
-                      <div className="border-b border-slate-100 pb-2.5">
-                        <h3 className="text-xs font-bold uppercase tracking-wider text-slate-750 flex items-center gap-1.5">
-                          <Upload className="w-4 h-4 text-indigo-500" />
-                          Dictionary စီမံခန့်ခွဲမှု (Manage Database)
-                        </h3>
-                        <p className="text-[10px] text-slate-450 mt-0.5">
-                          စကားလုံးဖွင့်ဆိုချက်များပါရှိသော .txt ဖိုင်များကို တင်သွင်းရန်နှင့် စီမံရန်
-                        </p>
-                      </div>
-
-                      {/* Securing Block: Passcode Verification Input */}
-                      <div className="bg-slate-50 border border-slate-200/80 p-3 rounded-xl space-y-2">
-                        <div className="flex items-center justify-between">
-                          <label className="text-[10px] font-bold text-slate-700 uppercase tracking-wide flex items-center gap-1">
-                            {passcode.trim() ? (
-                              <Unlock className="w-3.5 h-3.5 text-emerald-600 animate-pulse" />
-                            ) : (
-                              <Lock className="w-3.5 h-3.5 text-indigo-600" />
-                            )}
-                            ပိုင်ရှင်ဖြစ်ကြောင်း အတည်ပြုရန် လျှို့ဝှက်နံပါတ် (Passcode)
-                          </label>
-                        </div>
-                        <div className="relative">
-                          <input
-                            type="password"
-                            value={passcode}
-                            onChange={(e) => setPasscode(e.target.value)}
-                            placeholder="ဆာဗာသို့ တင်ရန် / လှမ်းဖျက်ရန် Passcode ရိုက်ထည့်ပါ..."
-                            className="w-full text-xs bg-white border border-slate-200 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100 rounded-lg py-1.5 pl-8 pr-3 transition-all font-mono placeholder:text-slate-400 placeholder:font-sans text-slate-755"
-                          />
-                          <div className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400">
-                            <Lock className="w-3.5 h-3.5" />
-                          </div>
-                        </div>
-                        <p className="text-[9px] text-slate-400 leading-relaxed">
-                          * <span className="font-semibold text-slate-500">Local Browser စနစ်ကို လူတိုင်းသုံးနိုင်သည်</span>။ သို့သော် ဆာဗာသို့ အပြီးသတ်တင်သွင်းရန်နှင့် ဆာဗာရှိ file များကို ဖျက်ရန်အတွက်မူ ပိုင်ရှင်သီးသန့် လျှို့ဝှက်နံပါတ် လိုအပ်ပါသည်။
-                        </p>
-                      </div>
-
-                      {/* Mode 1: Local Session for normal visitors */}
-                      <div className="space-y-1.5">
-                        <h4 className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">
-                          ၁။ မိမိစက်မှဖိုင်ကို Browser တွင် ခေတ္တတင်ရန် (Local Browser Mode)
-                        </h4>
-                        <div
-                          onDragOver={handleDragOver}
-                          onDragLeave={handleDragLeave}
-                          onDrop={handleDrop}
-                          onClick={() => fileInputRef.current?.click()}
-                          className={`border-2 border-dashed rounded-xl p-3.5 text-center cursor-pointer transition-all ${
-                            isDragging 
-                              ? "border-indigo-500 bg-indigo-50/45 text-indigo-700" 
-                              : "border-slate-200 hover:border-slate-300 hover:bg-slate-50 text-slate-605"
-                          }`}
-                        >
-                          <input
-                            type="file"
-                            ref={fileInputRef}
-                            onChange={handleLocalFileUpload}
-                            accept=".txt"
-                            className="hidden"
-                          />
-                          <Upload className="w-5 h-5 mx-auto text-slate-400 mb-1" />
-                          <p className="text-[11px] font-bold text-slate-700">
-                            {isDragging ? "ဤနေရာသို့ လွှတ်ချလိုက်ပါ" : "ဖိုင်ဆွဲထည့်ပါ သို့မဟုတ် ဤနေရာကို နှိပ်ပါ"}
-                          </p>
-                          <p className="text-[9px] text-slate-400 mt-0.5">
-                            ဖိုင်ရွေးပြီးပါက ဤ Browser ၏ Local Session တွင် ချက်ချင်းသိမ်းဆည်းပါမည်
+                      <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
+                        <div>
+                          <h3 className="text-xs font-bold uppercase tracking-wider text-slate-755 flex items-center gap-1.5">
+                            <Star className="w-4 h-4 text-amber-500 fill-amber-400" />
+                            စာမှတ်ပြုလုပ်ထားသောစာရင်း (Bookmarks)
+                          </h3>
+                          <p className="text-[10px] text-slate-450 mt-0.5">
+                            စိတ်ကြိုက်မှတ်သားထားသော ဝါကျနှင့် စကားလုံးများ
                           </p>
                         </div>
-                      </div>
-
-                      {/* Mode 2: Server Admin mode (Upload directly to code root directory) */}
-                      <div className="bg-indigo-50/40 border border-indigo-100/60 p-3 rounded-xl space-y-2">
-                        <h4 className="text-[10px] font-bold text-indigo-950 uppercase tracking-wider flex items-center gap-1">
-                          <Sparkles className="w-3.5 h-3.5 text-indigo-500" />
-                          ၂။ ဆာဗာပေါ်သို့ အမြဲတမ်း သိမ်းဆည်းရန် တင်သွင်းမည် (Server Upload)
-                        </h4>
-                        
-                        <input
-                          type="file"
-                          ref={serverFileInputRef}
-                          onChange={handleServerFileUpload}
-                          accept=".txt"
-                          className="hidden"
-                        />
-                        
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (!passcode.trim()) {
-                              showError("ဆာဗာသို့ တင်သွင်းရန် အပေါ်ရှိ Passcode လျှို့ဝှက်ချက်ကို အရင်ဆုံး ဖြည့်စွက်ပေးပါ။");
-                              return;
-                            }
-                            serverFileInputRef.current?.click();
-                          }}
-                          disabled={isUploadingToServer}
-                          className="w-full text-xs font-bold bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 text-white py-2 px-3 rounded-lg flex items-center justify-center gap-1.5 shadow-sm transition-all cursor-pointer"
-                        >
-                          {isUploadingToServer ? (
-                            <>
-                              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                              <span>ဆာဗာသို့ တင်ပို့နေသည်...</span>
-                            </>
-                          ) : (
-                            <>
-                              <FileText className="w-3.5 h-3.5" />
-                              <span>ဆာဗာပေါ်သို့ အပြီးသတ်တင်မည်</span>
-                            </>
-                          )}
-                        </button>
-                      </div>
-
-                      {/* Server files load and delete list */}
-                      <div className="space-y-2">
-                        <div className="flex items-center justify-between">
-                          <h4 className="text-[10px] font-bold text-slate-500 uppercase tracking-wider flex items-center gap-1">
-                            <FileText className="w-3.5 h-3.5 text-indigo-550" />
-                            Server Dictionary ဖိုင်များ
-                          </h4>
+                        {history.filter(item => item.isBookmarked).length > 0 && (
                           <button
-                            onClick={scanServerFiles}
-                            className="text-slate-400 hover:text-indigo-600 p-0.5 rounded transition-all cursor-pointer"
-                            title="ပြန်လည်ရှာဖွေရန်"
-                            disabled={isScanningServer}
+                            onClick={() => {
+                              setHistory((prev) => prev.map(item => ({ ...item, isBookmarked: false })));
+                              showSuccess("စာမှတ်အားလုံးကို ဖျက်သိမ်းလိုက်ပါပြီ။");
+                            }}
+                            className="text-[9px] text-rose-600 hover:text-rose-700 bg-rose-50 hover:bg-rose-100 px-2 py-0.5 rounded transition-all font-bold cursor-pointer"
+                            title="စာမှတ်အားလုံးကို ဖျက်သိမ်းပါမည်"
                           >
-                            <RefreshCw className={`w-3 h-3 ${isScanningServer ? "animate-spin" : ""}`} />
+                            အားလုံးဖျက်ရန်
                           </button>
-                        </div>
-
-                        {serverFiles.length > 0 ? (
-                          <div className="border border-slate-100 rounded-lg divide-y divide-slate-50 bg-slate-50/50 max-h-36 overflow-y-auto">
-                            {serverFiles.map((srv, idx) => (
-                              <div key={idx} className="p-2 flex items-center justify-between gap-1.5">
-                                <div className="min-w-0 flex-1">
-                                  <p className="text-[11px] font-medium text-slate-700 truncate" title={srv.filename}>
-                                    📄 {srv.filename}
-                                  </p>
-                                  <p className="text-[9px] text-slate-400 font-mono">
-                                    {(srv.size / 1024).toFixed(1)} KB
-                                  </p>
-                                </div>
-                                <div className="flex items-center gap-1">
-                                  <button
-                                    onClick={() => handleLoadServerFile(srv.filename)}
-                                    disabled={isLoadingServerFile !== null}
-                                    className="text-[10px] bg-white hover:bg-indigo-50 hover:text-indigo-600 border border-slate-205 px-2.5 py-1 rounded font-bold transition-all cursor-pointer disabled:opacity-50"
-                                    title="ဤ database ဖိုင်ကို system တွင် select လုပ်၍ parse လုပ်ပါ"
-                                  >
-                                    {isLoadingServerFile === srv.filename ? "..." : "Load"}
-                                  </button>
-                                  
-                                  <button
-                                    onClick={() => handleServerFileDelete(srv.filename)}
-                                    disabled={isDeletingFromServer !== null}
-                                    className="p-1 rounded text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-all cursor-pointer"
-                                    title="ဆာဗာပေါ်မှ အပြီးတိုင် ဖျက်ဆီးပစ်မည်"
-                                  >
-                                    {isDeletingFromServer === srv.filename ? (
-                                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                                    ) : (
-                                      <Trash2 className="w-3.5 h-3.5" />
-                                    )}
-                                  </button>
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        ) : (
-                          <div className="p-2.5 bg-slate-50 rounded-lg text-center border border-dashed border-slate-150">
-                            <p className="text-[9px] text-slate-400 italic">
-                              ဆာဗာ workspace root တွင် parse လုပ်ရန် .txt ဖိုင်ရှာမတွေ့ပါ။
-                            </p>
-                          </div>
                         )}
                       </div>
 
-                      {/* Debug parse info */}
-                      {parserDebugInfo && (
-                        <div className="bg-slate-50 p-3 rounded-lg border border-slate-100 text-[10px] text-slate-500 space-y-1">
-                          <div className="font-bold text-slate-600 text-[9px] uppercase tracking-wider flex items-center gap-1">
-                            <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-ping" />
-                            <span>📜 လက်ရှိ Active ဖြစ်နေသော Data Info:</span>
-                          </div>
-                          <div>• ဖိုင်အမည်: <span className="font-bold text-slate-700">{loadedFileName || "မသိရှိရပါ"}</span></div>
-                          <div>• စာကြောင်းစုစုပေါင်း: <b>{parserDebugInfo.totalLines.toLocaleString()} ကြောင်း</b></div>
-                          <div>• အောင်မြင်စွာဖတ်ပြီးသော စကားလုံးအရေအတွက်: <b className="text-emerald-600">{parserDebugInfo.parsedCount.toLocaleString()} လုံး</b></div>
+                      {history.filter(item => item.isBookmarked).length > 0 ? (
+                        <div className="space-y-2.5 divide-y divide-slate-100 max-h-72 overflow-y-auto pr-1">
+                          {history.filter(item => item.isBookmarked).map((hist) => (
+                            <div 
+                              key={hist.id} 
+                              className="pt-2.5 first:pt-0 pb-1.5 flex items-start justify-between gap-2 border-b border-dashed border-slate-100 last:border-0 group cursor-pointer"
+                              onClick={() => {
+                                setInputText(hist.originalText);
+                                setTranslationResult({
+                                  translation: hist.translation,
+                                  words: hist.words,
+                                });
+                                setSelectedWordIndex(0);
+                                setActiveRightTab("vocab");
+                              }}
+                            >
+                              <div className="min-w-0 flex-1 space-y-0.5">
+                                <p className="text-xs font-semibold text-slate-755 group-hover:text-indigo-600 truncate">
+                                  {hist.originalText}
+                                </p>
+                                <p className="text-xs text-emerald-600 truncate font-medium">
+                                  {hist.translation}
+                                </p>
+                                <p className="text-[9px] text-slate-400 font-mono">
+                                  {new Date(hist.timestamp).toLocaleDateString()} {new Date(hist.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                                </p>
+                              </div>
+                              
+                              <div className="flex items-center gap-1 shrink-0 opacity-80 group-hover:opacity-100 transition-opacity">
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setHistory((prev) =>
+                                      prev.map((item) =>
+                                        item.id === hist.id 
+                                          ? { ...item, isBookmarked: false } 
+                                          : item
+                                      )
+                                    );
+                                    showSuccess("စာမှတ်မှ ဖယ်ထုတ်လိုက်ပါပြီ။");
+                                  }}
+                                  className="p-1 rounded-md text-amber-500 hover:text-slate-400 hover:bg-slate-50 transition-colors"
+                                  title="စာမှတ်မှဖယ်ထုတ်ရန်"
+                                >
+                                  <Star className="w-3.5 h-3.5 fill-current text-amber-500" />
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="text-center py-12 text-slate-400">
+                          <Star className="w-8 h-8 mx-auto stroke-1 mb-1 text-slate-300" />
+                          <p className="text-xs font-bold text-slate-550">စာမှတ်ပြုလုပ်ထားသည်များ မရှိသေးပါ။</p>
+                          <p className="text-[10.5px] text-slate-400 mt-1 md:px-6 leading-relaxed">မှတ်တမ်း (History) tab မှ ဝါကျများကို ကြယ်ပွင့်ပုံစံနှိပ်၍ စာမှတ်အဖြစ် သိမ်းဆည်းရန် ဖြစ်ပါသည်။</p>
                         </div>
                       )}
                     </motion.div>
@@ -1837,39 +1798,46 @@ export default function App() {
                       animate={{ opacity: 1, scale: 1 }}
                       exit={{ opacity: 0, scale: 0.98 }}
                       transition={{ duration: 0.15 }}
-                      className="space-y-4"
+                      className="space-y-5"
                     >
                       <div className="border-b border-slate-100 pb-2.5">
                         <h3 className="text-xs font-bold uppercase tracking-wider text-slate-755 flex items-center gap-1.5">
-                          <Settings className="w-4 h-4 text-indigo-600" />
-                          Gemini API Key ဆက်တင်များ
+                          <HelpCircle className="w-4 h-4 text-indigo-600" />
+                          အသုံးပြုနည်း လမ်းညွှန်များ
                         </h3>
-                        <p className="text-[10px] text-slate-450 mt-0.5">
-                          အဖွဲ့ဝင်များ၊ အခြားသူများအား မျှဝေအသုံးပြုသည့်အခါ ၎င်းတို့၏ ကိုယ်ပိုင် API Key အသုံးပြုနိုင်ရေး။
-                        </p>
                       </div>
 
-                      <div className="space-y-3 bg-slate-50/60 p-3.5 rounded-xl border border-slate-100">
-                        <div className="text-[11px] leading-relaxed text-slate-650 space-y-2">
-                          <p>
-                            💡 <b>လုံခြုံရေး စနစ်သစ်:</b> ဆာဗာရှိ ပင်မ API Key ကို ပိုင်ရှင်ဖြစ်သူ သင်ကိုယ်တိုင်အတွက်သာ (လုံခြုံစိတ်ချစွာ) သီးသန့် ကန့်သတ်ထားပါသည်။
+                      <div className="space-y-4 bg-slate-50 border border-slate-150 p-4 rounded-xl text-slate-705 text-xs inline-block w-full">
+                        <div className="space-y-2.5">
+                          <p className="font-semibold text-slate-800 leading-relaxed">
+                            ၁။ မိမိကိုယ်ပိုင် Gemini API key ကို အောက်ပါကွက်လပ်၌ ဖြည့်ပါ။ မရှိပါက vpn ဖွင့်၍ အောက်ပါအတိုင်း Key ကို သွားယူပါ။
                           </p>
-                          <p>
-                            • အခြားသူများအား မျှဝေအသုံးပြုသည့်အခါ ၎င်းတို့ကိုယ်ပိုင် <b>Gemini API Key</b> ကို ဤနေရာတွင် ထည့်သွင်းသုံးစွဲရမည် ဖြစ်ပါသည်။
-                          </p>
-                          <p>
-                            • သင်ကိုယ်တိုင် (ပိုင်ရှင်) အသုံးပြုရန်အတွက် <b>'Dictionary'</b> တက်ဘ်တွင် ပျက်ကွက်မရှိ ဖြည့်စွက်ထားသော လျှို့ဝှက်နံပါတ် (Passcode) အား အသုံးပြု၍ ဆာဗာ၏ ပင်မ API Key ကို သုံးနိုင်ပါသည်။ (သင့် Browser တွင် Passcode အား စနစ်တကျ အမြဲတမ်းအလိုအလျောက် စိတ်ချစွာ မှတ်မိပေးထားပါသည်)
-                          </p>
-                          <p className="text-[10px] text-indigo-650 font-medium">
-                            🔒 <b>ဒေတာ လုံခြုံရေး:</b> ဤနေရာ၌ ဖြည့်စွက်လိုက်သော API Key များသည် သင့်စက်၏ Browser LocalStorage ထဲတွင်သာ လုံခြုံစွာ သိမ်းဆည်းမည်ဖြစ်ပြီး မည်သည့် ဆာဗာ သို့မဟုတ် တခြားသူဆီသို့မျှ လုံးဝမရောက်ရှိပါ။
-                          </p>
+                          
+                          <div className="pl-4 space-y-1.5 text-[11px] text-slate-650">
+                            <p className="flex items-center gap-1.5">
+                              <span>၂။</span>
+                              <a
+                                href="https://aistudio.google.com/"
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-indigo-600 hover:text-indigo-800 font-bold underline underline-offset-2"
+                              >
+                                https://aistudio.google.com/
+                              </a>
+                            </p>
+                            <p>၃။ မိမိ၏ (Gmail) ဖြင့် Login ဝင်ပေးပါ။</p>
+                            <p>၄။ Get API key ကို နှိပ်ပါ။</p>
+                            <p>၅။ Create API key ကို ထပ်နှိပ်ပါ။</p>
+                            <p>၆။ Create API key in new project နှိပ်ပါ။</p>
+                            <p>၇။ API Key ကို Copy ယူပါ။</p>
+                          </div>
                         </div>
                       </div>
 
                       <div className="space-y-2">
                         <div className="flex justify-between items-center">
                           <label className="block text-[10px] font-bold text-slate-700 uppercase tracking-wide">
-                            ဧည့်သည် / အဖွဲ့ဝင်များ၏ ကိုယ်ပိုင် Gemini API Key
+                            မိမိကိုယ်ပိုင် Gemini API Key ဖြည့်သွင်းရန်
                           </label>
                           {customApiKey.trim() && (
                             <span className="text-[9px] font-bold text-emerald-600 bg-emerald-50 border border-emerald-100/60 px-2 py-0.5 rounded-md flex items-center gap-1 animate-pulse">
@@ -1902,21 +1870,16 @@ export default function App() {
                         </div>
                       </div>
 
-                      <div className="pt-2">
+                      <div className="pt-1">
                         {customApiKey.trim() ? (
                           <div className="flex items-center gap-1.5 bg-emerald-50 text-emerald-700 border border-emerald-100 p-2.5 rounded-lg text-[10px] font-medium">
                             <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" />
-                            <span>အသုံးပြုနေသောစနစ်: <b>ကိုယ်ပိုင် API Key (Custom User Key)</b> ကို အသုံးပြုပြီး Gemini ဖြင့် ချိတ်ဆက်လုပ်ဆောင်ပါမည်။</span>
-                          </div>
-                        ) : passcode.trim() ? (
-                          <div className="flex items-center gap-1.5 bg-emerald-50 text-emerald-700 border border-emerald-100 p-2.5 rounded-lg text-[10px] font-medium">
-                            <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0 animate-pulse" />
-                            <span>အသုံးပြုနေသောစနစ်: ပိုင်ရှင်ဖြစ်ကြောင်း အတည်ပြုပြီးသဖြင့် ဆာဗာ၏ <b>Default Server Key</b> ဖြင့် အဆင်ပြေပြေ ဘာသာပြန်အလုပ်လုပ်နေပါသည်။</span>
+                            <span>အသုံးပြုနေသောစနစ်: <b>ကိုယ်ပိုင် API Key (Custom User Key)</b> ကို အသုံးပြုထားပါသည်။</span>
                           </div>
                         ) : (
                           <div className="flex items-center gap-1.5 bg-rose-50 text-rose-700 border border-rose-100 p-2.5 rounded-lg text-[10px] font-medium">
                             <div className="w-1.5 h-1.5 rounded-full bg-rose-500 shrink-0 animate-pulse" />
-                            <span>အသုံးပြုနေသောစနစ်: <b>API Key သို့မဟုတ် Passcode လိုအပ်ပါသည်</b> (အခြားသူများ ဆက်လက် ဘာသာပြန်ရန်အတွက် ကိုယ်ပိုင် Gemini API Key ဖြည့်သွင်းပေးရန် လိုအပ်ပါသည်)</span>
+                            <span>အသုံးပြုနေသောစနစ်: <b>ကိုယ်ပိုင် Gemini API Key ထည့်သွင်းပေးရန် လိုအပ်ပါသည်</b></span>
                           </div>
                         )}
                       </div>
@@ -1926,7 +1889,7 @@ export default function App() {
                           type="button"
                           onClick={() => {
                             setCustomApiKey("");
-                            showSuccess("ကိုယ်ပိုင် API Key ကို စနစ်အတွင်းမှ ရှင်းလင်းလိုက်ပါပြီ။ ဆာဗာ၏ မူလစနစ်ဖြင့် ပြန်လည်အလုပ်လုပ်ပါမည်။");
+                            showSuccess("ကိုယ်ပိုင် API Key ကို စနစ်အတွင်းမှ ရှင်းလင်းလိုက်ပါပြီ။");
                           }}
                           className="w-full text-[10px] bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-100/60 py-1.5 px-3 rounded-lg font-bold transition-all cursor-pointer flex items-center justify-center gap-1"
                         >
@@ -1943,17 +1906,13 @@ export default function App() {
         </div>
       </main>
 
-      <footer className="bg-slate-900 text-slate-400 border-t border-slate-800 mt-20 py-10 transition-colors">
-        <div className="max-w-6xl mx-auto px-4 text-center space-y-3">
-          <p className="text-sm">
-            <b>မြန်မာ အမြန်ဘာသာပြန်နှင့် ဝါစင်္ဂ Dictionary တွဲဖက်စက်</b> — Designed with Google Gemini 3.5 Flash API
+      <footer className="bg-slate-900 text-slate-300 border-t border-slate-800 mt-20 py-10 transition-colors">
+        <div className="max-w-full mx-auto px-4 md:px-8 text-center">
+          <p className="text-base md:text-lg font-semibold leading-relaxed text-slate-100">
+            အင်္ဂလိပ်စာကြောင်းတွေကို ဘာသာပြန်ပြီး စာပိုဒ်ထဲမှ ဝါစင်္ဂတွေကို Eng-Mya dictionary မှ Auto ရှာဖွေ၍ ဖော်ပြပေးပါသည်။
           </p>
-          <div className="flex justify-center gap-4 text-xs">
-            <span className="bg-slate-800 text-slate-300 px-2.5 py-1 rounded-sm">Skip prepositions, pronouns & articles: Activated</span>
-            <span className="bg-slate-800 text-slate-300 px-2.5 py-1 rounded-sm">Persistent cache: IndexedDB Enabled</span>
-          </div>
-          <p className="text-xs text-slate-600">
-            Current session tracking since 2026. All operations processed on secure Cloud-based servers.
+          <p className="text-sm text-slate-400 mt-3 font-medium">
+            Created by Ko Soe (Dawei)
           </p>
         </div>
       </footer>

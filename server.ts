@@ -50,7 +50,16 @@ async function startServer() {
   // API Route: Translate text and extract words
   app.post("/api/translate", async (req, res) => {
     try {
-      const { text, image, mimeType, customApiKey, passcode } = req.body;
+      let { text, image, mimeType, customApiKey, passcode } = req.body;
+
+      // Sanitizing/normalizing smart quotes, curly apostrophes, and ellipsis to prevent ByteString/encoding failures
+      if (text) {
+        text = text
+          .replace(/[\u2018\u2019]/g, "'") // Left and right curly single quotes -> straight single quote
+          .replace(/[\u201C\u201D]/g, '"') // Left and right curly double quotes -> straight double quote
+          .replace(/\u2026/g, "...");     // Ellipsis (...) -> three dots
+      }
+
       if ((!text || !text.trim()) && !image) {
         res.status(400).json({ error: "အင်္ဂလိပ် စာသား သို့မဟုတ် ပုံတစ်ပုံ တင်ပေးရန် လိုအပ်ပါသည်။ (Text or Image is required.)" });
         return;
