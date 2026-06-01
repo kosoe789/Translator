@@ -24,7 +24,10 @@ import {
   Key,
   Eye,
   EyeOff,
-  Clipboard
+  Clipboard,
+  Link as LinkIcon,
+  Globe,
+  CloudLightning
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { DictionaryEntry, WorkspaceFile, AnalyzedWord, HistoryItem } from "./types";
@@ -160,6 +163,10 @@ function clearDictionaryFromDB(): Promise<void> {
 export default function App() {
   // Inputs
   const [inputText, setInputText] = useState("");
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<"not_configured" | "synced" | "syncing" | "error">("not_configured");
+  const [lastSyncedTime, setLastSyncedTime] = useState<string | null>(null);
+  const isSyncingRef = useRef(false);
   const [dictionaryMap, setDictionaryMap] = useState<Map<string, string>>(new Map());
   const [dictionarySource, setDictionarySource] = useState<"sample" | "user_file">("sample");
   const [loadedFileName, setLoadedFileName] = useState<string>("");
@@ -249,10 +256,178 @@ export default function App() {
   const [customApiKey, setCustomApiKey] = useState<string>(() => localStorage.getItem("gemini_api_key") || "");
   const [showApiKey, setShowApiKey] = useState<boolean>(false);
 
+  // Cloud Sync Key states with backward compatibility
+  const [cloudSyncKey, setCloudSyncKey] = useState<string>(() => {
+    const existingSyncKey = localStorage.getItem("cloud_sync_key");
+    if (existingSyncKey) return existingSyncKey;
+    // Backward compatibility: if they had a gemini_api_key, copy it as cloud_sync_key so they don't lose sync
+    const existingApiKey = localStorage.getItem("gemini_api_key");
+    if (existingApiKey) {
+      localStorage.setItem("cloud_sync_key", existingApiKey);
+      return existingApiKey;
+    }
+    return "";
+  });
+  const [showSyncKey, setShowSyncKey] = useState<boolean>(false);
+
   // Save API key to localStorage when changed
   useEffect(() => {
     localStorage.setItem("gemini_api_key", customApiKey);
   }, [customApiKey]);
+
+  // Save cloud sync key to localStorage when changed
+  useEffect(() => {
+    localStorage.setItem("cloud_sync_key", cloudSyncKey);
+  }, [cloudSyncKey]);
+
+  // Native SHA-256 helper for API key hashing
+  const computeApiKeyHash = async (key: string): Promise<string | null> => {
+    if (!key || !key.trim()) return null;
+    try {
+      const msgBuffer = new TextEncoder().encode(key.trim());
+      const hashBuffer = await window.crypto.subtle.digest("SHA-256", msgBuffer);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    } catch (e) {
+      console.error("SHA256 computation failed", e);
+      return null;
+    }
+  };
+
+  // Merge local and remote histories robustly while keeping newer timestamps and bookmarks combined
+  const mergeHistory = (local: HistoryItem[], remote: HistoryItem[]): HistoryItem[] => {
+    const map = new Map<string, HistoryItem>();
+    
+    // Load remote items first (as fallback)
+    remote.forEach(item => {
+      const key = item.id || `${item.originalText}_${item.timestamp}`;
+      map.set(key, item);
+    });
+
+    // Load local items, resolving conflicts
+    local.forEach(item => {
+      const key = item.id || `${item.originalText}_${item.timestamp}`;
+      if (map.has(key)) {
+        const existing = map.get(key)!;
+        map.set(key, {
+          ...existing,
+          ...item,
+          isBookmarked: existing.isBookmarked || item.isBookmarked,
+          timestamp: Math.max(existing.timestamp, item.timestamp)
+        });
+      } else {
+        map.set(key, item);
+      }
+    });
+
+    return Array.from(map.values()).sort((a, b) => b.timestamp - a.timestamp);
+  };
+
+  const handleSyncWithCloud = async (overrideHistory?: HistoryItem[]) => {
+    if (!cloudSyncKey || !cloudSyncKey.trim()) {
+      setSyncStatus("not_configured");
+      return;
+    }
+
+    setIsSyncing(true);
+    setSyncStatus("syncing");
+    try {
+      const hash = await computeApiKeyHash(cloudSyncKey);
+
+      // 1. Fetch remote data
+      const res = await fetch("/api/sync/get", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ 
+          apiKeyHash: hash || undefined, 
+          apiKey: cloudSyncKey.trim() 
+        })
+      });
+
+      if (!res.ok) {
+        throw new Error("Failed to contact sync server.");
+      }
+
+      const data = await res.json();
+      const remoteHistory = data.history || [];
+
+      // 2. Intelligently merge remote history with current history
+      const currentLocal = overrideHistory || history;
+      const merged = mergeHistory(currentLocal, remoteHistory);
+
+      // 3. Update state (marking as non-writable trigger to prevent infinite auto-save back loops)
+      isSyncingRef.current = true;
+      setHistory(merged);
+      
+      // 4. Save merged history to remote to keep in lockstep
+      await fetch("/api/sync/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ 
+          apiKeyHash: hash || undefined, 
+          apiKey: cloudSyncKey.trim(), 
+          history: merged 
+        })
+      });
+
+      setSyncStatus("synced");
+      setLastSyncedTime(new Date().toLocaleTimeString());
+    } catch (err) {
+      console.error("Sync error:", err);
+      setSyncStatus("error");
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  // Automatically sync local changes to cloud (with debounce)
+  useEffect(() => {
+    if (!cloudSyncKey || !cloudSyncKey.trim()) {
+      setSyncStatus("not_configured");
+      return;
+    }
+
+    if (isSyncingRef.current) {
+      // Merged remotely downwards, so reset key and skip backing up
+      isSyncingRef.current = false;
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      try {
+        const hash = await computeApiKeyHash(cloudSyncKey);
+        const res = await fetch("/api/sync/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ 
+            apiKeyHash: hash || undefined, 
+            apiKey: cloudSyncKey.trim(), 
+            history 
+          })
+        });
+        if (res.ok) {
+          setSyncStatus("synced");
+          setLastSyncedTime(new Date().toLocaleTimeString());
+        } else {
+          setSyncStatus("error");
+        }
+      } catch (err) {
+        console.error("Auto-sync save failed:", err);
+        setSyncStatus("error");
+      }
+    }, 1500); // 1.5s debounce to group operations together cleanly
+
+    return () => clearTimeout(timer);
+  }, [history, cloudSyncKey]);
+
+  // Sync automatically upon initial load or when cloudSyncKey changes
+  useEffect(() => {
+    if (cloudSyncKey && cloudSyncKey.trim()) {
+      handleSyncWithCloud();
+    } else {
+      setSyncStatus("not_configured");
+    }
+  }, [cloudSyncKey]);
 
   // Initial load: Fetch server dictionary files and check IndexedDB
   useEffect(() => {
@@ -870,6 +1045,11 @@ export default function App() {
       return;
     }
 
+    if (!customApiKey || !customApiKey.trim()) {
+      showError("ဘာသာပြန်စနစ်ကို အသုံးပြုရန်အတွက် ဆက်တင် (Settings) ထဲတွင် သင်၏ ကိုယ်ပိုင် Gemini API Key ကို မဖြစ်မနေ ဦးစွာ ထည့်သွင်းပေးရန် လိုအပ်ပါသည်။");
+      return;
+    }
+
     setIsTranslating(true);
     setTranslationResult(null);
 
@@ -918,12 +1098,10 @@ export default function App() {
           const responseText = await response.text().catch(() => "");
 
           if (contentType && contentType.includes("application/json")) {
+            let isParsingSuccess = false;
             try {
               data = JSON.parse(responseText.trim());
-              if (data && data.error) {
-                throw new Error(data.error);
-              }
-              success = true;
+              isParsingSuccess = true;
             } catch (jsonErr: any) {
               console.warn(`Attempt ${attempts} failed to parse JSON from body:`, jsonErr);
               if (attempts >= maxAttempts) {
@@ -938,6 +1116,22 @@ export default function App() {
               }
               // Wait slightly before retrying (1000ms)
               await new Promise((resolve) => setTimeout(resolve, 1000));
+            }
+
+            if (isParsingSuccess) {
+              if (data && data.error) {
+                let errMsg = data.error;
+                // If it is an SDK error with embedded JSON, make it human-readable
+                if (typeof errMsg === "string") {
+                  if (errMsg.includes("API key not valid") || errMsg.includes("API_KEY_INVALID")) {
+                    errMsg = "ထည့်သွင်းထားသော Gemini API Key မမှန်ကန်ပါ။ ကျေးဇူးပြု၍ 'ဆက်တင် (Settings)' တက်ဘ်တွင် သင်၏ API Key ကို ပြန်လည်စစ်ဆေးပေးပါ။ (The provided Gemini API Key is invalid.)";
+                  } else if (errMsg.includes("quota") || errMsg.includes("QUOTA_EXCEEDED")) {
+                    errMsg = "Gemini API အသုံးပြုခွင့် Quota ကုန်ဆုံးသွားပါပြီ။ ခေတ္တစောင့်ဆိုင်းပြီးမှ ထပ်စမ်းကြည့်ပါ သို့မဟုတ် အခြား API Key တစ်ခု ပြောင်းသုံးပေးပါ။ (Quota exceeded.)";
+                  }
+                }
+                throw new Error(errMsg);
+              }
+              success = true;
             }
           } else {
             console.warn(`Attempt ${attempts} returned non-JSON response:`, responseText.slice(0, 150));
@@ -1046,13 +1240,14 @@ export default function App() {
         friendlyError = JSON.stringify(friendlyError);
       }
       
+      const upperError = friendlyError.toUpperCase();
       if (
         friendlyError.includes("429") || 
-        friendlyError.toUpperCase().includes("QUOTA") || 
-        friendlyError.toUpperCase().includes("RESOURCE_EXHAUSTED") || 
-        friendlyError.toUpperCase().includes("RATE_LIMIT") || 
-        friendlyError.toLowerCase().includes("exceeded") || 
-        friendlyError.toLowerCase().includes("limit")
+        upperError.includes("QUOTA") || 
+        upperError.includes("RESOURCE_EXHAUSTED") || 
+        upperError.includes("RATE_LIMIT") || 
+        upperError.includes("RATE LIMIT") ||
+        upperError.includes("RESOURCE EXHAUSTED")
       ) {
         friendlyError = "Gemini API ၏ တစ်မိနစ်အတွင်း အသုံးပြုမှုအကြိမ်ရေ (Rate Limit / Quota) ကန့်သတ်ချက် ပြည့်သွားသောကြောင့် ဖြစ်ပါသည်။ Google ၏ အခမဲ့ Free Tier စနစ်တွင် တစ်မိနစ်လျှင် အကြိမ်ရေ ၂၀ သာ ခွင့်ပြုထားခြင်းကြောင့် ဖြစ်ပြီး၊ ခေတ္တစက္ကန့် ၃၀ ခန့် စောင့်ဆိုင်းပြီးမှ ပြန်လည်စမ်းသပ်ပေးပါရန် မေတ္တာရပ်ခံအပ်ပါသည်။";
       } else if (
@@ -1300,7 +1495,7 @@ export default function App() {
                     </div>
 
                     <div className="p-4 bg-emerald-50/50 border border-emerald-100/55 rounded-xl">
-                      <p className="text-lg text-slate-800 leading-relaxed font-semibold">
+                      <p className="text-lg text-slate-800 leading-relaxed font-semibold whitespace-pre-wrap">
                         {translationResult.translation}
                       </p>
                     </div>
@@ -1546,7 +1741,7 @@ export default function App() {
                           value={searchQuery}
                           onChange={(e) => setSearchQuery(e.target.value)}
                           placeholder="အဘိဓာန်မှာ စာလုံးရှာမည်။"
-                          className="w-full text-xs pl-9 pr-4 py-2 rounded-xl border border-slate-200 text-slate-805 focus:outline-hidden focus:ring-1 focus:ring-indigo-500 placeholder-slate-400 font-medium"
+                          className="w-full text-xs pl-9 pr-4 py-2 rounded-xl border border-slate-200 text-slate-800 focus:outline-hidden focus:ring-1 focus:ring-indigo-500 placeholder-slate-400 font-medium animate-none"
                         />
                         <div className="absolute left-3.5 top-2.5 text-slate-400">
                           <Search className="w-3.5 h-3.5" />
@@ -1555,7 +1750,7 @@ export default function App() {
 
                       {searchQuery.trim() && (
                         <div className="mt-3 p-3.5 bg-slate-50 rounded-xl border border-slate-100 transition-all">
-                          <h4 className="text-[10px] font-bold text-slate-450 uppercase tracking-widest mb-1.5">
+                          <h4 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 animate-none">
                             Results for &quot;{searchQuery.trim()}&quot; :
                           </h4>
                           {searchResult ? (
@@ -1648,7 +1843,7 @@ export default function App() {
                                     );
                                     showSuccess("စာမှတ်မှ ဖယ်ထုတ်လိုက်ပါပြီ။");
                                   }}
-                                  className="p-1 rounded-md text-amber-500 hover:text-slate-400 hover:bg-slate-50 transition-colors"
+                                  className="p-1 rounded-md text-slate-400 hover:text-amber-500 hover:bg-slate-50 transition-colors"
                                   title="စာမှတ်မှဖယ်ထုတ်ရန်"
                                 >
                                   <Star className="w-3.5 h-3.5 fill-current text-amber-500" />
@@ -1659,8 +1854,8 @@ export default function App() {
                         </div>
                       ) : (
                         <div className="text-center py-12 text-slate-400">
-                          <Star className="w-8 h-8 mx-auto stroke-1 mb-1 text-slate-300" />
-                          <p className="text-xs font-bold text-slate-550">စာမှတ်ပြုလုပ်ထားသည်များ မရှိသေးပါ။</p>
+                          <Star className="w-8 h-8 mx-auto stroke-1 mb-1 text-slate-350" />
+                          <p className="text-xs font-bold text-slate-550 mr-1.5">စာမှတ်ပြုလုပ်ထားသည်များ မရှိသေးပါ။</p>
                           <p className="text-[10.5px] text-slate-400 mt-1 md:px-6 leading-relaxed">မှတ်တမ်း (History) tab မှ ဝါကျများကို ကြယ်ပွင့်ပုံစံနှိပ်၍ စာမှတ်အဖြစ် သိမ်းဆည်းရန် ဖြစ်ပါသည်။</p>
                         </div>
                       )}
@@ -1785,7 +1980,7 @@ export default function App() {
                       ) : (
                         <div className="text-center py-10 text-slate-400">
                           <History className="w-8 h-8 mx-auto stroke-1 mb-1 text-slate-350" />
-                          <p className="text-xs">သမိုင်းမှတ်တမ်း မရှိသေးပါ။</p>
+                          <p className="text-xs text-slate-500">သမိုင်းမှတ်တမ်း မရှိသေးပါ။</p>
                         </div>
                       )}
                     </motion.div>
@@ -1801,7 +1996,7 @@ export default function App() {
                       className="space-y-5"
                     >
                       <div className="border-b border-slate-100 pb-2.5">
-                        <h3 className="text-xs font-bold uppercase tracking-wider text-slate-755 flex items-center gap-1.5">
+<h3 className="text-xs font-bold uppercase tracking-wider text-slate-755 flex items-center gap-1.5">
                           <HelpCircle className="w-4 h-4 text-indigo-600" />
                           အသုံးပြုနည်း လမ်းညွှန်များ
                         </h3>
@@ -1896,6 +2091,58 @@ export default function App() {
                           Clear Custom API Key
                         </button>
                       )}
+
+                      {/* Cloud Sync Dashboard widget */}
+                      <div className="bg-gradient-to-br from-indigo-50/40 to-violet-50/40 border border-indigo-100 p-4 rounded-xl space-y-3 shadow-2xs mt-4">
+                        <div className="flex items-center justify-between">
+                          <h4 className="text-xs font-bold text-indigo-800 flex items-center gap-1.5 uppercase tracking-wide">
+                            <CloudLightning className="w-4 h-4 text-indigo-600" />
+                            ကွန်ပျူတာ နှင့် ဖုန်း Sync လုပ်ဆောင်ချက် (Cloud Synchronization)
+                          </h4>
+                        </div>
+
+                        <p className="text-[10.5px] text-slate-600 leading-relaxed md:text-[11px]">
+                          {!customApiKey.trim() ? (
+                            "ဒေတာများကို ဖုန်းနှင့် ကွန်ပျူတာ အချင်းချင်း စင့်ခ်လုပ်ရန်အတွက် အပေါ်ရှိ မိမိကိုယ်ပိုင် Gemini API Key ကို အရင်ဆုံး ဖြည့်သွင်းပေးရန် လိုအပ်ပါသည်။ API Key တူညီစွာ ထည့်သွင်းထားသော မည်သည့်စက်ပစ္စည်း (ဖုန်း/PC) မှမဆို သင်၏ ဘာသာပြန်မှတ်တမ်းများနှင့် Bookmarks များအားလုံးကို တပြိုင်နက်တည်း ချိတ်ဆက်ပေးမည်ဖြစ်ပါသည်။"
+                          ) : (
+                            "ကိုယ်ပိုင် API Key အခြေပြု တိမ်တိုက်စင့်ခ်လှုပ်ရှားမှုမှာ အောင်မြင်စွာ အလုပ်လုပ်နေပါသည်။ သင်၏ ဘာသာပြန်ရလဒ်များ၊ စာမှတ် (Bookmarks) သမိုင်းများကို ဆာဗာသို့ အလိုအလျောက် လုံခြုံစွာ သိမ်းဆည်းလင့်ခ်ပေးနေပါပြီ။"
+                          )}
+                        </p>
+
+                        {customApiKey.trim() && (
+                          <div className="space-y-2.5">
+                            <div className="flex items-center justify-between text-[11px] border-t border-slate-200/60 pt-2.5 text-slate-550">
+                              <span className="flex items-center gap-1">
+                                <RefreshCw className={`w-3.5 h-3.5 text-indigo-650 ${isSyncing ? "animate-spin" : ""}`} />
+                                Sync အခြေအနေ:
+                              </span>
+                              <span className="font-semibold text-slate-800">
+                                {syncStatus === "syncing" && "စင့်ခ်လုပ်နေပါသည်..."}
+                                {syncStatus === "synced" && "Cloud ပေါ်ရှိ ဒေတာများနှင့် တိုက်ဆိုင်ပြီးစီးပါပြီ"}
+                                {syncStatus === "error" && "ဒေတာချိတ်ဆက်ရန် အခက်အခဲရှိနေပါသည်"}
+                                {syncStatus === "not_configured" && "မစတင်ရသေးပါ"}
+                              </span>
+                            </div>
+
+                            {lastSyncedTime && (
+                              <div className="flex items-center justify-between text-[11px] text-slate-550">
+                                <span>နောက်ဆုံးစင့်ခ်လုပ်ချိန်:</span>
+                                <span className="font-mono font-semibold text-slate-700">{lastSyncedTime}</span>
+                              </div>
+                            )}
+
+                            <button
+                              type="button"
+                              disabled={isSyncing}
+                              onClick={() => handleSyncWithCloud()}
+                              className="w-full text-xs font-bold bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white py-2 px-4 rounded-lg shadow-sm transition-all cursor-pointer flex items-center justify-center gap-1.5"
+                            >
+                              <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? "animate-spin" : ""}`} />
+                              {isSyncing ? "မိုဘိုင်း/ကွန်ပျူတာ ဒေတာများ ဆွဲယူနေပါသည်..." : "ဒေတာကို ဆာဗာနှင့် ချက်ချင်း စင့်ခ်လုပ်ရန် (Pull & Sync Now)"}
+                            </button>
+                          </div>
+                        )}
+                      </div>
                     </motion.div>
                   )}
                 </AnimatePresence>
