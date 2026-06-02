@@ -167,6 +167,9 @@ export default function App() {
   const [syncStatus, setSyncStatus] = useState<"not_configured" | "synced" | "syncing" | "error">("not_configured");
   const [lastSyncedTime, setLastSyncedTime] = useState<string | null>(null);
   const isSyncingRef = useRef(false);
+  const latestHistoryRef = useRef<HistoryItem[]>([]);
+  const isTranslatingRef = useRef(false);
+  const isSyncingStateRef = useRef(false);
   const [dictionaryMap, setDictionaryMap] = useState<Map<string, string>>(new Map());
   const [dictionarySource, setDictionarySource] = useState<"sample" | "user_file">("sample");
   const [loadedFileName, setLoadedFileName] = useState<string>("");
@@ -205,12 +208,21 @@ export default function App() {
   });
 
   useEffect(() => {
+    latestHistoryRef.current = history;
     try {
       localStorage.setItem("em_translator_history", JSON.stringify(history));
     } catch (err) {
       console.error("Failed to save history to localStorage:", err);
     }
   }, [history]);
+
+  useEffect(() => {
+    isTranslatingRef.current = isTranslating;
+  }, [isTranslating]);
+
+  useEffect(() => {
+    isSyncingStateRef.current = isSyncing;
+  }, [isSyncing]);
 
   // UI helper alerts
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -300,21 +312,31 @@ export default function App() {
     
     // Load remote items first (as fallback)
     remote.forEach(item => {
-      const key = item.id || `${item.originalText}_${item.timestamp}`;
+      if (!item || !item.originalText) return;
+      const key = item.originalText.toLowerCase().trim();
       map.set(key, item);
     });
 
     // Load local items, resolving conflicts
     local.forEach(item => {
-      const key = item.id || `${item.originalText}_${item.timestamp}`;
+      if (!item || !item.originalText) return;
+      const key = item.originalText.toLowerCase().trim();
       if (map.has(key)) {
         const existing = map.get(key)!;
-        map.set(key, {
-          ...existing,
-          ...item,
-          isBookmarked: existing.isBookmarked || item.isBookmarked,
-          timestamp: Math.max(existing.timestamp, item.timestamp)
-        });
+        const isNowBookmarked = existing.isBookmarked || item.isBookmarked;
+        if (item.timestamp >= existing.timestamp) {
+          map.set(key, {
+            ...item,
+            isBookmarked: isNowBookmarked,
+            timestamp: Math.max(existing.timestamp, item.timestamp)
+          });
+        } else {
+          map.set(key, {
+            ...existing,
+            isBookmarked: isNowBookmarked,
+            timestamp: Math.max(existing.timestamp, item.timestamp)
+          });
+        }
       } else {
         map.set(key, item);
       }
@@ -329,6 +351,13 @@ export default function App() {
       return;
     }
 
+    // Extreme robustness: prevent concurrent overlapping requests to avoid state/race corruption
+    if (isSyncingStateRef.current) {
+      console.log("[Sync] Already in progress, skipping concurrent duplicate run.");
+      return;
+    }
+
+    isSyncingStateRef.current = true;
     setIsSyncing(true);
     setSyncStatus("syncing");
     try {
@@ -352,7 +381,7 @@ export default function App() {
       const remoteHistory = data.history || [];
 
       // 2. Intelligently merge remote history with current history
-      const currentLocal = overrideHistory || history;
+      const currentLocal = overrideHistory || latestHistoryRef.current;
       const merged = mergeHistory(currentLocal, remoteHistory);
 
       // 3. Update state (marking as non-writable trigger to prevent infinite auto-save back loops)
@@ -376,6 +405,7 @@ export default function App() {
       console.error("Sync error:", err);
       setSyncStatus("error");
     } finally {
+      isSyncingStateRef.current = false;
       setIsSyncing(false);
     }
   };
@@ -394,31 +424,52 @@ export default function App() {
     }
 
     const timer = setTimeout(async () => {
-      try {
-        const hash = await computeApiKeyHash(cloudSyncKey);
-        const res = await fetch("/api/sync/save", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ 
-            apiKeyHash: hash || undefined, 
-            apiKey: cloudSyncKey.trim(), 
-            history 
-          })
-        });
-        if (res.ok) {
-          setSyncStatus("synced");
-          setLastSyncedTime(new Date().toLocaleTimeString());
-        } else {
-          setSyncStatus("error");
-        }
-      } catch (err) {
-        console.error("Auto-sync save failed:", err);
-        setSyncStatus("error");
-      }
+      // Perform a safe, bidirectional fetch-merge-save sync on local updates
+      handleSyncWithCloud(history);
     }, 1500); // 1.5s debounce to group operations together cleanly
 
     return () => clearTimeout(timer);
   }, [history, cloudSyncKey]);
+
+  // Proactive background polling check & immediate triggers on interaction/visibility
+  useEffect(() => {
+    if (!cloudSyncKey || !cloudSyncKey.trim()) return;
+
+    // Run background polling every 5 seconds (only when not actively translating or syncing)
+    const interval = setInterval(() => {
+      if (!isTranslatingRef.current && !isSyncingStateRef.current) {
+        handleSyncWithCloud();
+      }
+    }, 5000);
+
+    // Immediate action trigger: when tab gets focus, browser wakes up or comes online
+    const triggerSyncOnInteraction = () => {
+      if (document.visibilityState === "visible" && !isTranslatingRef.current && !isSyncingStateRef.current) {
+        console.log("[Sync] Triggered instantaneous sync on wake/focus/online event.");
+        handleSyncWithCloud();
+      }
+    };
+
+    window.addEventListener("focus", triggerSyncOnInteraction);
+    document.addEventListener("visibilitychange", triggerSyncOnInteraction);
+    window.addEventListener("online", triggerSyncOnInteraction);
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener("focus", triggerSyncOnInteraction);
+      document.removeEventListener("visibilitychange", triggerSyncOnInteraction);
+      window.removeEventListener("online", triggerSyncOnInteraction);
+    };
+  }, [cloudSyncKey]);
+
+  // Trigger immediate sync update when user tab switches to history or bookmarks so they see computer's data instantly
+  useEffect(() => {
+    if (activeRightTab === "history" || activeRightTab === "bookmarks") {
+      if (cloudSyncKey && cloudSyncKey.trim() && !isTranslatingRef.current && !isSyncingStateRef.current) {
+        handleSyncWithCloud();
+      }
+    }
+  }, [activeRightTab, cloudSyncKey]);
 
   // Sync automatically upon initial load or when cloudSyncKey changes
   useEffect(() => {
