@@ -27,6 +27,7 @@ export interface HistoryItem {
   translation: string;
   timestamp: number;
   isBookmarked?: boolean;
+  isDeleted?: boolean;
   words: {
     original: string;
     base: string;

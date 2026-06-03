@@ -167,7 +167,6 @@ export default function App() {
   const [syncStatus, setSyncStatus] = useState<"not_configured" | "synced" | "syncing" | "error">("not_configured");
   const [lastSyncedTime, setLastSyncedTime] = useState<string | null>(null);
   const isSyncingRef = useRef(false);
-  const latestHistoryRef = useRef<HistoryItem[]>([]);
   const isTranslatingRef = useRef(false);
   const isSyncingStateRef = useRef(false);
   const [dictionaryMap, setDictionaryMap] = useState<Map<string, string>>(new Map());
@@ -206,6 +205,9 @@ export default function App() {
       return [];
     }
   });
+
+  const latestHistoryRef = useRef<HistoryItem[]>(history);
+  latestHistoryRef.current = history;
 
   useEffect(() => {
     latestHistoryRef.current = history;
@@ -306,7 +308,7 @@ export default function App() {
     }
   };
 
-  // Merge local and remote histories robustly while keeping newer timestamps and bookmarks combined
+  // Merge local and remote histories robustly while keeping newer timestamps, bookmarks, and soft-deletions aligned
   const mergeHistory = (local: HistoryItem[], remote: HistoryItem[]): HistoryItem[] => {
     const map = new Map<string, HistoryItem>();
     
@@ -323,17 +325,20 @@ export default function App() {
       const key = item.originalText.toLowerCase().trim();
       if (map.has(key)) {
         const existing = map.get(key)!;
-        const isNowBookmarked = existing.isBookmarked || item.isBookmarked;
+        const isNowBookmarked = item.timestamp >= existing.timestamp ? !!item.isBookmarked : !!existing.isBookmarked;
+        const isNowDeleted = item.timestamp >= existing.timestamp ? !!item.isDeleted : !!existing.isDeleted;
         if (item.timestamp >= existing.timestamp) {
           map.set(key, {
             ...item,
             isBookmarked: isNowBookmarked,
+            isDeleted: isNowDeleted,
             timestamp: Math.max(existing.timestamp, item.timestamp)
           });
         } else {
           map.set(key, {
             ...existing,
             isBookmarked: isNowBookmarked,
+            isDeleted: isNowDeleted,
             timestamp: Math.max(existing.timestamp, item.timestamp)
           });
         }
@@ -343,6 +348,41 @@ export default function App() {
     });
 
     return Array.from(map.values()).sort((a, b) => b.timestamp - a.timestamp);
+  };
+
+  const handleSaveToCloudDirectly = async (updatedHistory: HistoryItem[]) => {
+    if (!cloudSyncKey || !cloudSyncKey.trim()) {
+      setHistory(updatedHistory);
+      return;
+    }
+
+    // Set lock states & sync references
+    isSyncingRef.current = true;
+    isSyncingStateRef.current = true;
+    setIsSyncing(true);
+    setSyncStatus("syncing");
+    setHistory(updatedHistory);
+
+    try {
+      const hash = await computeApiKeyHash(cloudSyncKey);
+      await fetch("/api/sync/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ 
+          apiKeyHash: hash || undefined, 
+          apiKey: cloudSyncKey.trim(), 
+          history: updatedHistory 
+        })
+      });
+      setSyncStatus("synced");
+      setLastSyncedTime(new Date().toLocaleTimeString());
+    } catch (err) {
+      console.error("Direct sync save failed:", err);
+      setSyncStatus("error");
+    } finally {
+      isSyncingStateRef.current = false;
+      setIsSyncing(false);
+    }
   };
 
   const handleSyncWithCloud = async (overrideHistory?: HistoryItem[]) => {
@@ -1268,9 +1308,9 @@ export default function App() {
           (item) => item.originalText.toLowerCase() !== newItem.originalText.toLowerCase()
         );
         
-        const itemToInsert = existing 
-          ? { ...newItem, isBookmarked: existing.isBookmarked } 
-          : newItem;
+        const itemToInsert: HistoryItem = existing 
+          ? { ...newItem, isBookmarked: existing.isBookmarked, isDeleted: false } 
+          : { ...newItem, isDeleted: false };
 
         const merged = [itemToInsert, ...filtered];
         
@@ -1605,7 +1645,7 @@ export default function App() {
                   }`}
                 >
                   <Star className="w-3.5 h-3.5" />
-                  စာမှတ် {history.filter(item => item.isBookmarked).length > 0 ? `(${history.filter(item => item.isBookmarked).length})` : ""}
+                  စာမှတ် {history.filter(item => item.isBookmarked && !item.isDeleted).length > 0 ? `(${history.filter(item => item.isBookmarked && !item.isDeleted).length})` : ""}
                 </button>
                 <button
                   onClick={() => setActiveRightTab("history")}
@@ -1616,7 +1656,7 @@ export default function App() {
                   }`}
                 >
                   <History className="w-3.5 h-3.5" />
-                  မှတ်တမ်း {history.length > 0 ? `(${history.length})` : ""}
+                  မှတ်တမ်း {history.filter(item => !item.isDeleted).length > 0 ? `(${history.filter(item => !item.isDeleted).length})` : ""}
                 </button>
               </div>
 
@@ -1838,10 +1878,11 @@ export default function App() {
                             စိတ်ကြိုက်မှတ်သားထားသော ဝါကျနှင့် စကားလုံးများ
                           </p>
                         </div>
-                        {history.filter(item => item.isBookmarked).length > 0 && (
+                        {history.filter(item => item.isBookmarked && !item.isDeleted).length > 0 && (
                           <button
                             onClick={() => {
-                              setHistory((prev) => prev.map(item => ({ ...item, isBookmarked: false })));
+                              const unbookmarkedAll = history.map(item => ({ ...item, isBookmarked: false, timestamp: Date.now() }));
+                              handleSaveToCloudDirectly(unbookmarkedAll);
                               showSuccess("စာမှတ်အားလုံးကို ဖျက်သိမ်းလိုက်ပါပြီ။");
                             }}
                             className="text-[9px] text-rose-600 hover:text-rose-700 bg-rose-50 hover:bg-rose-100 px-2 py-0.5 rounded transition-all font-bold cursor-pointer"
@@ -1852,9 +1893,9 @@ export default function App() {
                         )}
                       </div>
 
-                      {history.filter(item => item.isBookmarked).length > 0 ? (
+                      {history.filter(item => item.isBookmarked && !item.isDeleted).length > 0 ? (
                         <div className="space-y-2.5 divide-y divide-slate-100 max-h-72 overflow-y-auto pr-1">
-                          {history.filter(item => item.isBookmarked).map((hist) => (
+                          {history.filter(item => item.isBookmarked && !item.isDeleted).map((hist) => (
                             <div 
                               key={hist.id} 
                               className="pt-2.5 first:pt-0 pb-1.5 flex items-start justify-between gap-2 border-b border-dashed border-slate-100 last:border-0 group cursor-pointer"
@@ -1888,7 +1929,7 @@ export default function App() {
                                     setHistory((prev) =>
                                       prev.map((item) =>
                                         item.id === hist.id 
-                                          ? { ...item, isBookmarked: false } 
+                                          ? { ...item, isBookmarked: false, timestamp: Date.now() } 
                                           : item
                                       )
                                     );
@@ -1932,12 +1973,18 @@ export default function App() {
                             ရှာဖွေခဲ့သမျှ စာရင်းဇယားမှတ်တမ်း (Bookmark များ မပျက်ပါ)
                           </p>
                         </div>
-                        {history.length > 0 && (
+                        {history.filter(item => !item.isDeleted).length > 0 && (
                           <button
                             onClick={() => {
-                              const bookmarkedOnly = history.filter(item => item.isBookmarked);
-                              setHistory(bookmarkedOnly);
-                              if (bookmarkedOnly.length < history.length) {
+                              const activeNonBookmarked = history.filter(item => !item.isDeleted && !item.isBookmarked);
+                              if (activeNonBookmarked.length > 0) {
+                                const cleared = history.map(item => {
+                                  if (!item.isBookmarked) {
+                                    return { ...item, isDeleted: true, timestamp: Date.now() };
+                                  }
+                                  return item;
+                                });
+                                handleSaveToCloudDirectly(cleared);
                                 showSuccess("သမိုင်းမှတ်တမ်းကို ရှင်းလင်းလိုက်ပါပြီ။ Bookmark ပြုလုပ်ထားသော အရာများသာ ချန်လှပ်ထားပါသည်။");
                               } else {
                                 showSuccess("ဖျက်ရန် သမိုင်းမှတ်တမ်းအသစ် မရှိသေးပါ။");
@@ -1951,9 +1998,9 @@ export default function App() {
                         )}
                       </div>
 
-                      {history.length > 0 ? (
+                      {history.filter(item => !item.isDeleted).length > 0 ? (
                         <div className="space-y-2.5 divide-y divide-slate-100 max-h-72 overflow-y-auto pr-1">
-                          {history.map((hist) => (
+                          {history.filter(item => !item.isDeleted).map((hist) => (
                             <div 
                               key={hist.id} 
                               className="pt-2.5 first:pt-0 pb-1.5 flex items-start justify-between gap-2 border-b border-dashed border-slate-100 last:border-0 group cursor-pointer"
@@ -1998,7 +2045,7 @@ export default function App() {
                                     setHistory((prev) =>
                                       prev.map((item) =>
                                         item.id === hist.id 
-                                          ? { ...item, isBookmarked: !item.isBookmarked } 
+                                          ? { ...item, isBookmarked: !item.isBookmarked, timestamp: Date.now() } 
                                           : item
                                       )
                                     );
@@ -2017,7 +2064,13 @@ export default function App() {
                                   type="button"
                                   onClick={(e) => {
                                     e.stopPropagation();
-                                    setHistory((prev) => prev.filter((item) => item.id !== hist.id));
+                                    const updated = history.map((item) =>
+                                      item.id === hist.id 
+                                        ? { ...item, isDeleted: true, timestamp: Date.now() } 
+                                        : item
+                                    );
+                                    handleSaveToCloudDirectly(updated);
+                                    showSuccess("ဤမှတ်တမ်းကိုဖျက်လိုက်ပါပြီ။");
                                   }}
                                   className="p-1 rounded-md text-slate-350 hover:text-rose-600 hover:bg-rose-50 transition-colors"
                                   title="ဤမှတ်တမ်းကိုဖျက်ရန်"
