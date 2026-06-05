@@ -9,22 +9,20 @@ import dotenv from "dotenv";
 // Load environment variables
 dotenv.config();
 
-// Sync file configuration in /tmp to prevent watcher restarts on write
-const OLD_SYNC_FILE_PATH = path.join(process.cwd(), "user_sync_data.json");
-const SYNC_FILE_PATH = "/tmp/user_sync_data.json";
+// Sync file configuration using the persistent workspace path to avoid data loss on container recycle.
+// Since file watching is disabled (DISABLE_HMR=true) in this setup, writing here will not trigger HMR reloads.
+const SYNC_FILE_PATH = path.join(process.cwd(), "user_sync_data.json");
+const TMP_SYNC_FILE_PATH = "/tmp/user_sync_data.json";
 
-// Migrate old sync file if it exists and clean up the old file to stop watcher triggers
+// Wipe previous sync files on boot to perform a clean start as requested
 try {
-  if (fs.existsSync(OLD_SYNC_FILE_PATH)) {
-    if (!fs.existsSync(SYNC_FILE_PATH)) {
-      fs.copyFileSync(OLD_SYNC_FILE_PATH, SYNC_FILE_PATH);
-      console.log("Migrating user sync file to /tmp successfully.");
-    }
-    fs.unlinkSync(OLD_SYNC_FILE_PATH);
-    console.log("Successfully removed old user_sync_data.json from workspace root.");
+  fs.writeFileSync(SYNC_FILE_PATH, "{}", "utf-8");
+  if (fs.existsSync(TMP_SYNC_FILE_PATH)) {
+    fs.writeFileSync(TMP_SYNC_FILE_PATH, "{}", "utf-8");
   }
-} catch (migErr) {
-  console.error("Error migrating/cleaning up sync file:", migErr);
+  console.log("Cleared all server sync records perfectly.");
+} catch (err) {
+  console.error("Error clearing sync files:", err);
 }
 
 // Helper to safely read user sync data
@@ -85,22 +83,22 @@ async function queryGeminiWithExtremeResilience(ai: any, contents: any): Promise
             properties: {
               extractedText: {
                 type: Type.STRING,
-                description: "The transcribed/extracted English text from the image, or the original unchanged input text if no image is used.",
+                description: "The transcribed/extracted text from the image, the identified object name in English (e.g. Object: Apple) if there is no text in the image, or the original unchanged source input text.",
               },
               translation: {
                 type: Type.STRING,
-                description: "The complete natural translation of the English text into Myanmar.",
+                description: "The complete natural translation. If the source text is English, translate it into Myanmar. If the source text is Myanmar (or an identified object in English), translate it into English.",
               },
               words: {
                 type: Type.ARRAY,
-                description: "List of interesting/meaningful vocabulary words containing actual semantic content.",
+                description: "Exhaustive, comprehensive list of UNIQUE English vocabulary words, including single nouns, verbs (main/lexical verbs), adjectives, adverbs, conjunctions, numbers, compound nouns (e.g., 'ice cream', 'social media', 'air conditioner', 'bus stop'), and compound adjectives (e.g., 'well-known', 'hard-working', 'part-time') from the source text. Order them chronologically by their first appearance. Do NOT under any circumstances omit or skip any nouns, adjectives, compound nouns, compound adjectives, or lexical verbs! Do NOT include articles, pronouns, prepositions, duplicate words, or any auxiliary/helping/modal verbs (such as is, am, are, was, were, have, has, had, do, does, did, will, would, can, could, etc.). Ensure compound words are kept as a single entry with spaces or hyphens intact.",
                 items: {
                   type: Type.OBJECT,
                   properties: {
-                    original: { type: Type.STRING },
-                    base: { type: Type.STRING },
-                    pos: { type: Type.STRING },
-                    fallback_my: { type: Type.STRING },
+                    original: { type: Type.STRING, description: "The English word as it appears in the English source text or translated English text." },
+                    base: { type: Type.STRING, description: "The base/dictionary form of the English word in lowercase." },
+                    pos: { type: Type.STRING, description: "Grammatical part of speech of the English word." },
+                    fallback_my: { type: Type.STRING, description: "A simple, clear Myanmar definition tailored to the word context." },
                   },
                   required: ["original", "base", "pos", "fallback_my"],
                 },
@@ -306,7 +304,7 @@ async function startServer() {
       }
 
       if ((!text || !text.trim()) && !image) {
-        res.status(400).json({ error: "အင်္ဂလိပ် စာသား သို့မဟုတ် ပုံတစ်ပုံ တင်ပေးရန် လိုအပ်ပါသည်။ (Text or Image is required.)" });
+        res.status(400).json({ error: "စာသား သို့မဟုတ် ပုံတစ်ပုံ တင်ပေးရန် လိုအပ်ပါသည်။ (Text or Image is required.)" });
         return;
       }
 
@@ -328,53 +326,111 @@ async function startServer() {
           },
         };
         const textPart = {
-          text: `You are an expert bilingual English to Myanmar translator and lexicographer.
-Read and analyze the English text present in this image. 
-If an English text context is provided below, use it to aid extraction:
-Text prompt: "${text || ""}"
+          text: `You are an expert bilingual English <-> Myanmar translator, image creator/lexicographer, and computer vision object identifier.
+Read and analyze the provided image first. Determine if it contains text or mainly physical objects without text.
 
-1. Extract/transcribe ALL of the visible English text from the image accurately as "extractedText".
-2. Translate the identified English text into clear, natural, and contextually precise Myanmar (Burmese) language as "translation".
-   CRITICAL: The translation MUST strictly preserve and match the paragraph structure of the extracted English text. Translate paragraph-by-paragraph and separate each paragraph in the Burmese translation with double newlines matching the source paragraph breaks exactly.
-3. Extract ALL meaningful content/vocabulary words from the transcribed English text (e.g., nouns, verbs, adjectives, adverbs).
-   CRITICAL: Do NOT skip or omit any vocabulary noun, verb, adjective, or adverb. Even if a word is very common, simple, or short, it MUST be extracted! For example:
-   - Extract words like 'round', 'first', 'place', 'third', 'most', 'study', 'time', 'day', 'show', 'vote', 'ballot', 'finished', etc.
-   - Do NOT be selective. Be EXHAUSTIVE and list every single content word in chronological order as they appear in the text.
-   EXCLUDE ONLY purely grammatical function words:
-   - Articles (a, an, the)
-   - Pronouns (I, me, my, we, us, you, he, she, they, this, that, etc.)
-   - Prepositions (of, to, in, for, on, with, at, by, from, of, etc.)
-   - Conjunctions (and, but, or, nor, yet, so, because, if, etc.)
-   - Basic auxiliary/be verbs (is, am, are, was, were, be, been, do, does, did) unless they carry a unique lexical meaning.
+CHOOSE THE CORRECT SCENARIO TO FOLLOW:
 
-For each extracted word:
-- Provide its base/dictionary form in lowercase (e.g., 'went' -> 'go', 'studies' -> 'study', 'hopes' -> 'hope', 'finished' -> 'finish').
-- Provide its lexical part of speech (pos) (e.g., noun, verb, adjective, adverb).
-- Provide a brief, simple fallback Myanmar definition ('fallback_my') specifically tailored to how the word is used in this sentence context.
+Scenario 1: THERE IS TEXT IN THE IMAGE
+- Identify whether the visible text in the image is English or Myanmar (Burmese).
+- If the text is English:
+  - Set "extractedText" to the exact transcribed English text found in the image.
+  - Set "translation" to its clear, natural, and contextually precise Myanmar (Burmese) translation.
+- If the text is Myanmar (Burmese):
+  - Set "extractedText" to the exact transcribed Myanmar text found in the image.
+  - Set "translation" to its clear, natural, and contextually precise English translation.
+- CRITICAL paragraph-alignment restriction: The translated output MUST strictly preserve and match the paragraph structure of the transcribed text. Translate paragraph-by-paragraph and separate each paragraph in the translation with double newlines matching the source paragraph breaks exactly so that they align.
+
+Scenario 2: THE IMAGE HAS NO TEXT (IT IS AN IMAGE OF A PHYSICAL OBJECT/SCENE)
+- Identify the central/prominent object(s) or entity in the image (e.g. apple, cat, guitar, house, etc.).
+- Set "extractedText" ONLY to the precise, exact English name of the object (e.g. "Apple" or "Guitar"). Do NOT include descriptions or sentence phrases.
+- Set "translation" ONLY to its brief, exact, and clear Myanmar translation (e.g., "ပန်းသီး" or "ဂစ်တာ").
+
+VOCABULARY WORDS EXTRACTION (under "words"):
+Extract ALL UNIQUE English vocabulary words, compound nouns, and compound adjectives from the model's English/translated text, EXCEPT prepositions, pronouns, articles, duplicate/repeat words, and auxiliary/helping verbs.
+- If Scenario 1 was used and the image text was English: extract words from that English text.
+- If Scenario 1 was used and the image text was Myanmar: extract English words from the *translated English text*.
+- If Scenario 2 was used: extract the core English name/components of the object (e.g., 'apple', 'red').
+CRITICAL: Extraction MUST target English vocabulary entries so that the client-side system can locate rich, preloaded English-to-Myanmar definitions!
+
+STRICT RULES FOR EXCLUSION vs. EXTRACTION:
+- You MUST omit/skip the following categories:
+  1. Articles (အာတီကယ်): a, an, the
+  2. Pronouns (နာမ်စား): I, me, my, mine, myself, we, us, our, ours, you, your, yours, yourself, he, him, his, she, her, they, them, their, this, that, these, those, etc.
+  3. Prepositions (ဝိဘတ်): of, to, in, for, on, with, at, by, from, up, about, into, over, after, during, through, before, between, under, along, behind, down, off, out, etc.
+  4. Auxiliary / Helping / Modal verbs (ကူညီကိရိယာများ): am, is, are, was, were, be, been, being, have, has, had, having, do, does, did, doing, will, would, shall, should, can, could, may, might, must, ought, etc.
+  5. DUPLICATE/REPEAT WORDS: If a word (or its base/compound form) has already been extracted, do NOT list it again.
+- YOU MUST EXHAUSTIVELY EXTRACT EVERY SINGLE lexically meaningful item:
+  - Lexical Verbs (main action/state verbs)
+  - Nouns (such as book, science, dictionary)
+  - Compound Nouns (e.g., 'ice cream', 'social media', 'computer science', 'bus stop', 'air conditioner', 'heart attack') - extract them intact as a single entry with spaces preserved!
+  - Adjectives (such as happy, blue, beautiful)
+  - Compound Adjectives (e.g., 'well-known', 'hard-working', 'two-story', 'part-time', 'old-fashioned') - extract them intact as a single entry with hyphens preserved!
+  - Adverbs (such as quickly, very, yesterday)
+  - Conjunctions (such as because, although, and, but)
+  - Numbers and other descriptives (such as three, double).
+- CRITICAL: You are strictly forbidden from omitting or skipping any lexical verbs, nouns, adjectives, compound nouns, or compound adjectives from the text. The extraction must be 100% complete and exhaustive.
+- Analyze the text word-by-word/phrase-by-phrase in chronological order. Do not repeat items.
+- Ensure the 'original' and 'base' words are extracted CLEANLY, without any trailing or surrounding punctuation (no trailing dots, commas, parentheses, quotes), but preserving internal hyphens or spaces intact.
+
+For each extracted English word/compound:
+- Provide its "original" spelling exactly as it appears in the English source/translation (freed from grammar punctuation).
+- Provide its base/dictionary form in lowercase ("base") (e.g., studies -> study, went -> go, apples -> apple, running -> run). Keep hyphens and spaces in compounds intact!
+- Provide its lexical part of speech ("pos") (e.g., noun, verb, adjective, adverb, conjunction).
+- Provide a brief, simple fallback Myanmar definition ("fallback_my") reflecting its contextual meaning.
+
+Additional text prompt context if provided by user: "${text || ""}"
 
 Return the result strictly conforming to the requested JSON schema.`,
         };
         contents = { parts: [imagePart, textPart] };
       } else {
         console.log(`Translating and analyzing text: ${text.slice(0, 50)}...`);
-        contents = `You are an expert bilingual English to Myanmar translator and lexicographer.
-Translate the following English text to clear, natural Myanmar (Burmese) language.
-CRITICAL: Your translation MUST strictly preserve and match the paragraph structure of the source English text. Translate paragraph-by-paragraph and separate each paragraph in the Burmese translation using double newlines matching the source paragraph breaks exactly so that they align beautifully.
-Also, analyze and extract ALL meaningful words/vocabulary items from this text.
-CRITICAL: Do NOT skip or omit any vocabulary noun, verb, adjective, or adverb. Even if a word is very common, simple, or short, it MUST be extracted! For example:
-- Extract words like 'round', 'first', 'place', 'third', 'most', 'study', 'time', 'day', 'show', 'vote', 'ballot', 'finished', etc.
-- Do NOT be selective. Be EXHAUSTIVE and list every single content word in chronological order as they appear in the text.
-EXCLUDE ONLY purely grammatical function words:
-- Articles (a, an, the)
-- Pronouns (I, me, My, we, us, you, he, she, they, this, that, etc.)
-- Prepositions (of, to, in, for, on, with, at, by, from, of, etc.)
-- Conjunctions (and, but, or, nor, yet, so, because, if, etc.)
-- Basic auxiliary/be verbs (is, am, are, was, were, be, been, do, does, did) unless they carry a unique lexical meaning.
+        contents = `You are an expert bilingual English <-> Myanmar translator and lexicographer.
+Read the input text and identify its language (English or Myanmar).
 
-For each extracted word:
-- Extract its base/dictionary form in lowercase (e.g., 'went' -> 'go', 'studies' -> 'study', 'hopes' -> 'hope', 'finished' -> 'finish').
-- Provide its lexical part of speech (pos) (e.g., noun, verb, adjective, adverb).
-- Provide a brief, simple fallback Myanmar definition ('fallback_my') specifically suited to how the word is used in this sentence context.
+FOLLOW THE CORRECT TRANSLATION FLOW:
+1. If the input text is in English:
+   - Set "extractedText" to the exact input English text.
+   - Set "translation" to its clear, natural, and contextually precise Myanmar (Burmese) translation.
+   - Extract key English vocabulary words from the original English input text under "words".
+2. If the input text is in Myanmar (Burmese):
+   - Set "extractedText" to the exact input Myanmar text.
+   - Set "translation" to its clear, natural, and contextually precise English translation.
+   - Extract key English vocabulary words from the *translated English text* under "words" so that the client's English-to-Myanmar dictionary map can lookup definitions.
+
+CRITICAL TRANSLATION RULE:
+Your translation MUST strictly preserve and match the paragraph structure of the source text. Translate paragraph-by-paragraph and separate each paragraph in the translation using double newlines matching the source paragraph breaks exactly so that they align beautifully.
+
+VOCABULARY WORDS COLLECTION (under "words"):
+Extract ALL UNIQUE English vocabulary words, compound nouns, and compound adjectives from the English text (either the original English text or the translated English text), EXCEPT prepositions, pronouns, articles, duplicate/repeat words, and auxiliary/helping verbs.
+CRITICAL: Extraction MUST target English entries so that the client-side system can locate rich, preloaded English-to-Myanmar definitions!
+
+STRICT RULES FOR EXCLUSION vs. EXTRACTION:
+- You MUST omit/skip the following categories:
+  1. Articles (အာတီကယ်): a, an, the
+  2. Pronouns (နာမ်စား): I, me, my, mine, myself, we, us, our, ours, you, your, yours, yourself, he, him, his, she, her, they, them, their, this, that, these, those, etc.
+  3. Prepositions (ဝိဘတ်): of, to, in, for, on, with, at, by, from, up, about, into, over, after, during, through, before, between, under, along, behind, down, off, out, etc.
+  4. Auxiliary / Helping / Modal verbs (ကူညီကိရိယာများ): am, is, are, was, were, be, been, being, have, has, had, having, do, does, did, doing, will, would, shall, should, can, could, may, might, must, ought, etc.
+  5. DUPLICATE/REPEAT WORDS: If a word (or its base/compound form) has already been extracted, do NOT list it again.
+- YOU MUST EXHAUSTIVELY EXTRACT EVERY SINGLE lexically meaningful item:
+  - Lexical Verbs (main action/state verbs)
+  - Nouns (such as book, science, dictionary)
+  - Compound Nouns (e.g., 'ice cream', 'social media', 'computer science', 'bus stop', 'air conditioner', 'heart attack') - extract them intact as a single entry with spaces preserved!
+  - Adjectives (such as happy, blue, beautiful)
+  - Compound Adjectives (e.g., 'well-known', 'hard-working', 'two-story', 'part-time', 'old-fashioned') - extract them intact as a single entry with hyphens preserved!
+  - Adverbs (such as quickly, very, yesterday)
+  - Conjunctions (such as because, although, and, but)
+  - Numbers and other descriptives (such as three, double).
+- CRITICAL: You are strictly forbidden from omitting or skipping any lexical verbs, nouns, adjectives, compound nouns, or compound adjectives from the text. The extraction must be 100% complete and exhaustive.
+- Analyze the text word-by-word/phrase-by-phrase in chronological order of their first appearance. Do not repeat items.
+- Ensure the 'original' and 'base' words are extracted CLEANLY, without any trailing or surrounding punctuation (no trailing dots, commas, parentheses, quotes), but preserving internal hyphens or spaces intact.
+
+For each extracted English word/compound:
+- Provide its "original" spelling exactly as it appears in the English source/translation (freed from grammar punctuation).
+- Provide its base/dictionary form in lowercase ("base") (e.g., studies -> study, went -> go, apples -> apple, running -> run). Keep hyphens and spaces in compounds intact!
+- Provide its lexical part of speech ("pos") (e.g., noun, verb, adjective, adverb, conjunction).
+- Provide a brief, simple fallback Myanmar definition ("fallback_my") reflecting its contextual meaning.
 
 Input text:
 """
@@ -382,8 +438,8 @@ ${text}
 """
 
 Return the output containing:
-"extractedText": output the exact input text string.
-"translation": Myanmar translation.
+"extractedText": extracted text string.
+"translation": translated string.
 "words": array of extracted words.`;
       }
 
@@ -441,6 +497,68 @@ Return the output containing:
       }
       if (!parsedJSON.words || !Array.isArray(parsedJSON.words)) {
         parsedJSON.words = [];
+      } else {
+        // Pre-compile lists of forbidden words (lowercase) for absolute safety and exact matching
+        const forbiddenWords = new Set([
+          // Articles
+          "a", "an", "the",
+          // Pronouns
+          "i", "me", "my", "mine", "myself", "we", "us", "our", "ours", "ourselves", 
+          "you", "your", "yours", "yourself", "yourselves", "he", "him", "his", "himself", 
+          "she", "her", "hers", "herself", "it", "its", "itself", "they", "them", "their", 
+          "theirs", "themselves", "this", "that", "these", "those", "who", "whom", "whose", 
+          "which", "what", "any", "some", "someone", "somebody", "something", "anybody", 
+          "anyone", "anything", "nobody", "noone", "nothing", "everyone", "everybody", "everything",
+          // Prepositions
+          "of", "to", "in", "for", "on", "with", "at", "by", "from", "up", "about", "into", "over", 
+          "after", "during", "through", "before", "between", "under", "along", "behind", "down", "off", 
+          "out", "since", "until", "upon", "within", "without", "above", "across", "against", "alongside", 
+          "among", "around", "below", "beneath", "beside", "besides", "beyond", "except", "inside", 
+          "near", "outside", "past", "throughout", "toward", "towards", "underneath",
+          // Auxiliary / Helping / Modal Verbs & variants
+          "am", "is", "are", "was", "were", "be", "been", "being", 
+          "have", "has", "had", "having", "do", "does", "did", "doing", 
+          "will", "would", "shall", "should", "can", "could", "may", "might", "must", "ought"
+        ]);
+
+        // Guaranteed case-insensitive deduplication and strict category filtering of vocabulary,
+        // preserving the exact chronological order of their first appearance.
+        const seenBases = new Set<string>();
+        const uniqueWords: any[] = [];
+        for (const item of parsedJSON.words) {
+          if (!item || typeof item !== "object") continue;
+          
+          const baseKey = (item.base || "").trim().toLowerCase();
+          const origKey = (item.original || "").trim().toLowerCase();
+          
+          // Clean leading and trailing punctuation (retaining internal spaces and hyphens intact)
+          const cleanWord = (w: string) => {
+            return w.trim()
+              .replace(/^[.,\/#!$%\^&\*;:{}=\_`~()?"'’‘“”•*]+|[.,\/#!$%\^&\*;:{}=\_`~()?"'’‘“”•*]+$/g, "")
+              .trim();
+          };
+          const cleanBaseKey = cleanWord(baseKey);
+          const cleanOrigKey = cleanWord(origKey);
+
+          if (!cleanBaseKey && !cleanOrigKey) continue;
+
+          // If either original or base form is in our forbidden words set, skip!
+          if (forbiddenWords.has(cleanBaseKey) || forbiddenWords.has(cleanOrigKey)) {
+            continue;
+          }
+          
+          // Use base form first for deduplication, fallback to original if base is empty
+          const dedupKey = cleanBaseKey || cleanOrigKey;
+          
+          if (!seenBases.has(dedupKey)) {
+            seenBases.add(dedupKey);
+            // Assign cleared strings back to item
+            item.base = cleanBaseKey;
+            item.original = cleanOrigKey;
+            uniqueWords.push(item);
+          }
+        }
+        parsedJSON.words = uniqueWords;
       }
 
       res.json(parsedJSON);

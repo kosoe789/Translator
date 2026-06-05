@@ -160,6 +160,30 @@ function clearDictionaryFromDB(): Promise<void> {
   });
 }
 
+// Resilient fetch helper to automatically handle transient network/proxy errors like 'Failed to fetch' or cold-start timeouts
+async function resilientFetch(input: RequestInfo | URL, init?: RequestInit, retries = 5, delay = 1500): Promise<Response> {
+  let lastError: any = null;
+  let currentDelay = delay;
+  for (let i = 0; i < retries; i++) {
+    try {
+      const response = await fetch(input, init);
+      // Automatically retry on temporary gateway or server overloaded statuses
+      if (response.status === 502 || response.status === 503 || response.status === 504) {
+        throw new Error(`Server returned temporary status ${response.status}`);
+      }
+      return response;
+    } catch (err: any) {
+      lastError = err;
+      console.warn(`Fetch to ${input} attempt ${i + 1} failed: ${err.message || err}. Retrying in ${currentDelay}ms...`);
+      if (i < retries - 1) {
+        await new Promise((resolve) => setTimeout(resolve, currentDelay));
+        currentDelay *= 1.8; // Backoff
+      }
+    }
+  }
+  throw lastError || new Error(`Failed to fetch ${input} after ${retries} attempts.`);
+}
+
 export default function App() {
   // Inputs
   const [inputText, setInputText] = useState("");
@@ -208,6 +232,7 @@ export default function App() {
 
   const latestHistoryRef = useRef<HistoryItem[]>(history);
   latestHistoryRef.current = history;
+  const hasDoneInitialSyncRef = useRef<boolean>(false);
 
   useEffect(() => {
     latestHistoryRef.current = history;
@@ -308,39 +333,27 @@ export default function App() {
     }
   };
 
-  // Merge local and remote histories robustly while keeping newer timestamps, bookmarks, and soft-deletions aligned
+  // Rebuild mergeHistory from scratch: merges local and remote history items robustly on initial sync
   const mergeHistory = (local: HistoryItem[], remote: HistoryItem[]): HistoryItem[] => {
     const map = new Map<string, HistoryItem>();
     
-    // Load remote items first (as fallback)
+    // We map remote items first
     remote.forEach(item => {
       if (!item || !item.originalText) return;
-      const key = item.originalText.toLowerCase().trim();
+      if (item.isDeleted) return; // Ignore soft-deleted ones from older model
+      const key = (item.id || item.originalText).toLowerCase().trim();
       map.set(key, item);
     });
 
-    // Load local items, resolving conflicts
+    // We map local items second, resolving conflicts by keeping the one with the newer timestamp
     local.forEach(item => {
       if (!item || !item.originalText) return;
-      const key = item.originalText.toLowerCase().trim();
+      if (item.isDeleted) return; // Ignore soft-deleted ones
+      const key = (item.id || item.originalText).toLowerCase().trim();
       if (map.has(key)) {
         const existing = map.get(key)!;
-        const isNowBookmarked = item.timestamp >= existing.timestamp ? !!item.isBookmarked : !!existing.isBookmarked;
-        const isNowDeleted = item.timestamp >= existing.timestamp ? !!item.isDeleted : !!existing.isDeleted;
         if (item.timestamp >= existing.timestamp) {
-          map.set(key, {
-            ...item,
-            isBookmarked: isNowBookmarked,
-            isDeleted: isNowDeleted,
-            timestamp: Math.max(existing.timestamp, item.timestamp)
-          });
-        } else {
-          map.set(key, {
-            ...existing,
-            isBookmarked: isNowBookmarked,
-            isDeleted: isNowDeleted,
-            timestamp: Math.max(existing.timestamp, item.timestamp)
-          });
+          map.set(key, item);
         }
       } else {
         map.set(key, item);
@@ -350,22 +363,27 @@ export default function App() {
     return Array.from(map.values()).sort((a, b) => b.timestamp - a.timestamp);
   };
 
+  // Saves updated history array directly to the cloud, overwriting the server backup with the user's latest state
   const handleSaveToCloudDirectly = async (updatedHistory: HistoryItem[]) => {
+    // Make sure we update local state first
+    setHistory(updatedHistory);
+
     if (!cloudSyncKey || !cloudSyncKey.trim()) {
-      setHistory(updatedHistory);
       return;
     }
 
-    // Set lock states & sync references
+    // Mark that initial sync is ready
+    hasDoneInitialSyncRef.current = true;
+
+    // Set lock states & sync status
     isSyncingRef.current = true;
     isSyncingStateRef.current = true;
     setIsSyncing(true);
     setSyncStatus("syncing");
-    setHistory(updatedHistory);
 
     try {
       const hash = await computeApiKeyHash(cloudSyncKey);
-      await fetch("/api/sync/save", {
+      await resilientFetch("/api/sync/save", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ 
@@ -385,15 +403,16 @@ export default function App() {
     }
   };
 
+  // Fetches cloud data and merges it with local storage on startup or key setup
   const handleSyncWithCloud = async (overrideHistory?: HistoryItem[]) => {
     if (!cloudSyncKey || !cloudSyncKey.trim()) {
       setSyncStatus("not_configured");
       return;
     }
 
-    // Extreme robustness: prevent concurrent overlapping requests to avoid state/race corruption
+    // Prevent concurrent overlapping requests to avoid state/race corruption
     if (isSyncingStateRef.current) {
-      console.log("[Sync] Already in progress, skipping concurrent duplicate run.");
+      console.log("[Sync] Already in progress, skipping concurrent run.");
       return;
     }
 
@@ -404,7 +423,7 @@ export default function App() {
       const hash = await computeApiKeyHash(cloudSyncKey);
 
       // 1. Fetch remote data
-      const res = await fetch("/api/sync/get", {
+      const res = await resilientFetch("/api/sync/get", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ 
@@ -424,12 +443,12 @@ export default function App() {
       const currentLocal = overrideHistory || latestHistoryRef.current;
       const merged = mergeHistory(currentLocal, remoteHistory);
 
-      // 3. Update state (marking as non-writable trigger to prevent infinite auto-save back loops)
+      // 3. Update local state
       isSyncingRef.current = true;
       setHistory(merged);
       
-      // 4. Save merged history to remote to keep in lockstep
-      await fetch("/api/sync/save", {
+      // 4. Save merged history to remote to align both perfectly
+      await resilientFetch("/api/sync/save", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ 
@@ -438,6 +457,9 @@ export default function App() {
           history: merged 
         })
       });
+
+      // Confirm that the initial sync is complete
+      hasDoneInitialSyncRef.current = true;
 
       setSyncStatus("synced");
       setLastSyncedTime(new Date().toLocaleTimeString());
@@ -457,30 +479,43 @@ export default function App() {
       return;
     }
 
+    // Critical: only auto-save AFTER the initial sync has loaded the user's bookmarks from the server!
+    // This absolutely prevents empty local arrays from overwriting remote bookmarks on refresh.
+    if (!hasDoneInitialSyncRef.current) {
+      return;
+    }
+
     if (isSyncingRef.current) {
-      // Merged remotely downwards, so reset key and skip backing up
       isSyncingRef.current = false;
       return;
     }
 
     const timer = setTimeout(async () => {
-      // Perform a safe, bidirectional fetch-merge-save sync on local updates
-      handleSyncWithCloud(history);
+      try {
+        const hash = await computeApiKeyHash(cloudSyncKey);
+        await resilientFetch("/api/sync/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ 
+            apiKeyHash: hash || undefined, 
+            apiKey: cloudSyncKey.trim(), 
+            history: history 
+          })
+        });
+        setSyncStatus("synced");
+        setLastSyncedTime(new Date().toLocaleTimeString());
+      } catch (err) {
+        console.error("Auto-sync save failed:", err);
+        setSyncStatus("error");
+      }
     }, 1500); // 1.5s debounce to group operations together cleanly
 
     return () => clearTimeout(timer);
   }, [history, cloudSyncKey]);
 
-  // Proactive background polling check & immediate triggers on interaction/visibility
+  // Proactive immediate triggers on interaction/visibility (without resource-wasting 5s loop)
   useEffect(() => {
     if (!cloudSyncKey || !cloudSyncKey.trim()) return;
-
-    // Run background polling every 5 seconds (only when not actively translating or syncing)
-    const interval = setInterval(() => {
-      if (!isTranslatingRef.current && !isSyncingStateRef.current) {
-        handleSyncWithCloud();
-      }
-    }, 5000);
 
     // Immediate action trigger: when tab gets focus, browser wakes up or comes online
     const triggerSyncOnInteraction = () => {
@@ -495,7 +530,6 @@ export default function App() {
     window.addEventListener("online", triggerSyncOnInteraction);
 
     return () => {
-      clearInterval(interval);
       window.removeEventListener("focus", triggerSyncOnInteraction);
       document.removeEventListener("visibilitychange", triggerSyncOnInteraction);
       window.removeEventListener("online", triggerSyncOnInteraction);
@@ -597,7 +631,7 @@ export default function App() {
   const scanServerFiles = async (): Promise<WorkspaceFile[]> => {
     setIsScanningServer(true);
     try {
-      const res = await fetch("/api/dictionary-files");
+      const res = await resilientFetch("/api/dictionary-files");
       if (!res.ok) throw new Error("Could not list server files.");
       const data = await res.json();
       const files = data.files || [];
@@ -892,7 +926,7 @@ export default function App() {
   const handleLoadServerFile = async (filename: string) => {
     setIsLoadingServerFile(filename);
     try {
-      const response = await fetch(`/api/dictionary-file?filename=${encodeURIComponent(filename)}`);
+      const response = await resilientFetch(`/api/dictionary-file?filename=${encodeURIComponent(filename)}`);
       
       let data: any;
       const contentType = response.headers.get("content-type");
@@ -962,7 +996,7 @@ export default function App() {
       if (typeof text === "string") {
         setIsUploadingToServer(true);
         try {
-          const res = await fetch("/api/upload-dictionary", {
+          const res = await resilientFetch("/api/upload-dictionary", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -1016,7 +1050,7 @@ export default function App() {
 
     setIsDeletingFromServer(filename);
     try {
-      const res = await fetch("/api/delete-dictionary", {
+      const res = await resilientFetch("/api/delete-dictionary", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1173,7 +1207,7 @@ export default function App() {
       while (attempts < maxAttempts && !success) {
         attempts++;
         try {
-          response = await fetch("/api/translate", {
+          response = await resilientFetch("/api/translate", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ 
@@ -1381,7 +1415,7 @@ export default function App() {
           <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.03),transparent)] pointer-events-none" />
           
           <h1 className="relative text-2xl sm:text-3.5xl font-extrabold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-white via-indigo-100 to-indigo-50 drop-shadow-sm">
-            English to Myanmar Translator and Definitions
+            Translator and Definitions
           </h1>
         </div>
 
@@ -1467,7 +1501,7 @@ export default function App() {
               <textarea
                 value={inputText}
                 onChange={(e) => setInputText(e.target.value)}
-                placeholder="မြန်မာဘာသာပြန်လိုသော အင်္ဂလိပ်စာကို ထည့်ပါ။"
+                placeholder="ဘာသာပြန်လိုသော အင်္ဂလိပ် (သို့) မြန်မာစာသားကို ထည့်ပါ။"
                 rows={5}
                 className="w-full text-base p-4 rounded-xl bg-slate-50 border border-slate-200 text-slate-800 placeholder-slate-400 focus:outline-hidden focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500 focus:bg-white resize-y transition-all font-sans leading-relaxed text-slate-900"
                 disabled={isTranslating}
@@ -1564,7 +1598,7 @@ export default function App() {
                     <div className="flex justify-between items-center mb-4">
                       <h3 className="text-sm font-bold tracking-wider text-emerald-700 uppercase flex items-center gap-2">
                         <Sparkles className="w-4 h-4 text-emerald-500" />
-                        မြန်မာဘာသာပြန်ချက်
+                        {translationResult && !/[\u1000-\u109f]/.test(translationResult.translation) ? "အင်္ဂလိပ်ဘာသာပြန်ချက်" : "မြန်မာဘာသာပြန်ချက်"}
                       </h3>
 
                       <button
@@ -2260,7 +2294,7 @@ export default function App() {
       <footer className="bg-slate-900 text-slate-300 border-t border-slate-800 mt-20 py-10 transition-colors">
         <div className="max-w-full mx-auto px-4 md:px-8 text-center">
           <p className="text-base md:text-lg font-semibold leading-relaxed text-slate-100">
-            အင်္ဂလိပ်စာကြောင်းတွေကို ဘာသာပြန်ပြီး စာပိုဒ်ထဲမှ ဝါစင်္ဂတွေကို Eng-Mya dictionary မှ Auto ရှာဖွေ၍ ဖော်ပြပေးပါသည်။
+            အင်္ဂလိပ် (သို့) မြန်မာစာကြောင်းတွေကို ဘာသာပြန်ပြီး စာပိုဒ်ထဲမှ ဝါစင်္ဂတွေကို Eng-Mya dictionary မှ Auto ရှာဖွေ၍ ဖော်ပြပေးပါသည်။
           </p>
           <p className="text-sm text-slate-400 mt-3 font-medium">
             Created by Ko Soe (Dawei)
