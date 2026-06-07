@@ -215,11 +215,10 @@ function getGenAIClient(customApiKey?: string): GoogleGenAI {
   return fallbackGenAI;
 }
 
-// Global express instance configuration (Crucial for Vercel Serverless Function entrypoint)
-const app = express();
-const PORT = process.env.PORT || 3000;
-
 async function startServer() {
+  const app = express();
+  const PORT = 3000;
+
   // JSON body parser
   app.use(express.json({ limit: "50mb" }));
 
@@ -461,15 +460,273 @@ Return the output containing:
         console.warn("Direct JSON parsing failed, attempting markdown/enclosure cleaning...");
         
         // Attempt 2: Clean markdown backticks ```json ... ``` or ``` ... ```
-        const jsonMatch = cleanText.match(/
-http://googleusercontent.com/immersive_entry_chip/0
+        const jsonMatch = cleanText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+        if (jsonMatch && jsonMatch[1]) {
+          try {
+            parsedJSON = JSON.parse(jsonMatch[1].trim());
+          } catch (jsonErr2) {
+            console.error("Parsing clean markdown JSON block failed:", jsonErr2);
+          }
+        }
+        
+        if (!parsedJSON) {
+          // Attempt 3: Find first '{' and last '}' to extract raw object
+          const firstBrace = cleanText.indexOf("{");
+          const lastBrace = cleanText.lastIndexOf("}");
+          if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+            try {
+              const substringContent = cleanText.slice(firstBrace, lastBrace + 1);
+              parsedJSON = JSON.parse(substringContent);
+            } catch (jsonErr3) {
+              console.error("Parsing brace-aligned JSON substring failed:", jsonErr3);
+            }
+          }
+        }
+      }
 
----
+      if (!parsedJSON) {
+        throw new Error(`ဘာသာပြန် ရလဒ်အား စနစ်မှ ဖတ်မရပါ။ (Failed to extract valid JSON data from response). Raw: ${responseText.slice(0, 150)}...`);
+      }
 
-## Vercel ပေါ်မှာ အလုပ်လုပ်သွားအောင် ပြောင်းလဲထားတဲ့ အဓိကအချက်များ -
+      // Gracefully handle partial/missing properties if Strategy B/C was used
+      if (!parsedJSON.extractedText) {
+        parsedJSON.extractedText = text || "";
+      }
+      if (!parsedJSON.translation) {
+        parsedJSON.translation = parsedJSON.extractedText; // fallback to text itself
+      }
+      if (!parsedJSON.words || !Array.isArray(parsedJSON.words)) {
+        parsedJSON.words = [];
+      } else {
+        // Pre-compile lists of forbidden words (lowercase) for absolute safety and exact matching
+        const forbiddenWords = new Set([
+          // Articles
+          "a", "an", "the",
+          // Pronouns
+          "i", "me", "my", "mine", "myself", "we", "us", "our", "ours", "ourselves", 
+          "you", "your", "yours", "yourself", "yourselves", "he", "him", "his", "himself", 
+          "she", "her", "hers", "herself", "it", "its", "itself", "they", "them", "their", 
+          "theirs", "themselves", "this", "that", "these", "those", "who", "whom", "whose", 
+          "which", "what", "any", "some", "someone", "somebody", "something", "anybody", 
+          "anyone", "anything", "nobody", "noone", "nothing", "everyone", "everybody", "everything",
+          // Prepositions
+          "of", "to", "in", "for", "on", "with", "at", "by", "from", "up", "about", "into", "over", 
+          "after", "during", "through", "before", "between", "under", "along", "behind", "down", "off", 
+          "out", "since", "until", "upon", "within", "without", "above", "across", "against", "alongside", 
+          "among", "around", "below", "beneath", "beside", "besides", "beyond", "except", "inside", 
+          "near", "outside", "past", "throughout", "toward", "towards", "underneath",
+          // Auxiliary / Helping / Modal Verbs & variants
+          "am", "is", "are", "was", "were", "be", "been", "being", 
+          "have", "has", "had", "having", "do", "does", "did", "doing", 
+          "will", "would", "shall", "should", "can", "could", "may", "might", "must", "ought"
+        ]);
 
-1. **`export default app;` ကို အောက်ဆုံးမှာ ပေါင်းထည့်ထားခြင်း:** Vercel ရဲ့ `@vercel/node` engine က ဒီ Express app object ကို ဖမ်းပြီး Serverless Function တစ်ခုအနေနဲ့ auto conversion လုပ်ပေးမှာ ဖြစ်လို့ ဒါက မရှိမဖြစ် လိုအပ်ပါတယ်။
-2. **`listen` flow ကို `if` ပိတ်ထားခြင်း:** Production mode (Vercel) ပေါ်ရောက်ရင် `listen` ကို ကျော်သွားစေပြီး Vercel ရဲ့ Dynamic Gateway ကပဲ တာဝန်ယူ မောင်းနှင်ပေးမှာ ဖြစ်ပါတယ်။
-3. **`app` instantiation ကို သီးသန့်ထုတ်ထားခြင်း:** `app = express()` ကို function အပြင်ဘက်ကို ထုတ်ထားပေးတဲ့အတွက် Vercel Router က runtime ခေါ်တဲ့အခါ endpoint တွေကို အမှားအယွင်းမရှိ ခြေရာခံမိစေမှာ ဖြစ်ပါတယ်။
+        // Guaranteed case-insensitive deduplication and strict category filtering of vocabulary,
+        // preserving the exact chronological order of their first appearance.
+        const seenBases = new Set<string>();
+        const uniqueWords: any[] = [];
+        for (const item of parsedJSON.words) {
+          if (!item || typeof item !== "object") continue;
+          
+          const baseKey = (item.base || "").trim().toLowerCase();
+          const origKey = (item.original || "").trim().toLowerCase();
+          
+          // Clean leading and trailing punctuation (retaining internal spaces and hyphens intact)
+          const cleanWord = (w: string) => {
+            return w.trim()
+              .replace(/^[.,\/#!$%\^&\*;:{}=\_`~()?"'’‘“”•*]+|[.,\/#!$%\^&\*;:{}=\_`~()?"'’‘“”•*]+$/g, "")
+              .trim();
+          };
+          const cleanBaseKey = cleanWord(baseKey);
+          const cleanOrigKey = cleanWord(origKey);
 
-ဒီကုဒ်အပြည့်အစုံကို `server.ts` ထဲ အစားထိုးထည့်သွင်းပြီး ယခင်အဆင့်က ပြောပြခဲ့တဲ့ `vercel.json` နဲ့အတူ GitHub ပေါ် **Push** တင်လိုက်ရင် အားလုံး အဆင်ပြေပြေ Live ဖြစ်သွားပါလိမ့်မယ်ဗျာ! အဆင်ပြေရဲ့လား စမ်းကြည့်ပေးပါဦးနော်။
+          if (!cleanBaseKey && !cleanOrigKey) continue;
+
+          // If either original or base form is in our forbidden words set, skip!
+          if (forbiddenWords.has(cleanBaseKey) || forbiddenWords.has(cleanOrigKey)) {
+            continue;
+          }
+          
+          // Use base form first for deduplication, fallback to original if base is empty
+          const dedupKey = cleanBaseKey || cleanOrigKey;
+          
+          if (!seenBases.has(dedupKey)) {
+            seenBases.add(dedupKey);
+            // Assign cleared strings back to item
+            item.base = cleanBaseKey;
+            item.original = cleanOrigKey;
+            uniqueWords.push(item);
+          }
+        }
+        parsedJSON.words = uniqueWords;
+      }
+
+      res.json(parsedJSON);
+    } catch (err: any) {
+      console.error("Translation API error:", err);
+      try {
+        const errorLog = `${new Date().toISOString()} - ERROR: ${err?.message || err}\nSTACK: ${err?.stack || ""}\nCustomApiKey: ${customApiKey ? "Present (masked: ... " + customApiKey.slice(-4) + ")" : "Not Present"}\n\n`;
+        fs.appendFileSync("/tmp/translate_error.log", errorLog, "utf-8");
+      } catch (logErr) {
+        console.error("Failed to write to error log:", logErr);
+      }
+      res.status(500).json({ error: err.message || "An error occurred during translation." });
+    }
+  });
+
+  // API Route: List uploaded .txt dictionary files in the workspace directory
+  app.get("/api/dictionary-files", (req, res) => {
+    try {
+      const workspaceDir = process.cwd();
+      const files = fs.readdirSync(workspaceDir);
+      
+      const txtFiles = files.filter(file => {
+        const ext = path.extname(file).toLowerCase();
+        return ext === ".txt" && file !== ".env.example" && file !== "requirements.txt";
+      }).map(file => {
+        const stats = fs.statSync(path.join(workspaceDir, file));
+        return {
+          filename: file,
+          size: stats.size,
+          mtime: stats.mtime,
+        };
+      });
+
+      res.json({ files: txtFiles });
+    } catch (err: any) {
+      console.error("Error listing dictionary files:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // API Route: Securely upload a .txt dictionary file to the workspace
+  app.post("/api/upload-dictionary", (req, res) => {
+    try {
+      const { filename, content, passcode } = req.body;
+      
+      // Determine secret passcode, defaulting to "admin123" if not defined in env
+      const adminPasscode = process.env.ADMIN_UPLOAD_PASSCODE || "admin123";
+      if (!passcode || passcode !== adminPasscode) {
+        res.status(401).json({ error: "လျှို့ဝှက်နံပါတ် (Passcode) မှားယွင်းနေပါသည်။" });
+        return;
+      }
+
+      if (!filename || typeof filename !== "string" || !content || typeof content !== "string") {
+        res.status(400).json({ error: "Filename and content are required." });
+        return;
+      }
+
+      const safeFilename = path.basename(filename);
+      if (!safeFilename.endsWith(".txt") || safeFilename === ".env.example" || safeFilename === "requirements.txt") {
+        res.status(400).json({ error: "Invalid file type. Only .txt files can be uploaded to the server." });
+        return;
+      }
+
+      const filePath = path.join(process.cwd(), safeFilename);
+      fs.writeFileSync(filePath, content, "utf-8");
+      console.log(`Secured upload: ${safeFilename} saved successfully.`);
+      res.json({ success: true, message: "ဖိုင်ကို ဆာဗာသို့ အောင်မြင်စွာ တင်ပြီးပါပြီ။" });
+    } catch (err: any) {
+      console.error("Error securing dictionary upload:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // API Route: Securely delete a .txt dictionary file from the server workspace
+  app.post("/api/delete-dictionary", (req, res) => {
+    try {
+      const { filename, passcode } = req.body;
+      
+      const adminPasscode = process.env.ADMIN_UPLOAD_PASSCODE || "admin123";
+      if (!passcode || passcode !== adminPasscode) {
+        res.status(401).json({ error: "လျှို့ဝှက်နံပါတ် (Passcode) မှားယွင်းနေပါသည်။" });
+        return;
+      }
+
+      if (!filename || typeof filename !== "string") {
+        res.status(400).json({ error: "Filename is required" });
+        return;
+      }
+
+      const safeFilename = path.basename(filename);
+      if (!safeFilename.endsWith(".txt") || safeFilename === ".env.example" || safeFilename === "requirements.txt") {
+        res.status(400).json({ error: "Invalid file type." });
+        return;
+      }
+
+      const filePath = path.join(process.cwd(), safeFilename);
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+        console.log(`Secured delete: ${safeFilename} deleted successfully.`);
+        res.json({ success: true, message: "ဖိုင်ကို ဆာဗာမှ ပယ်ဖျက်လိုက်ပါပြီ။" });
+      } else {
+        res.status(404).json({ error: "File not found" });
+      }
+    } catch (err: any) {
+      console.error("Error securing dictionary deletion:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // API Route: Read the content of a dictionary .txt file from the workspace
+  app.get("/api/dictionary-file", (req, res) => {
+    try {
+      const { filename } = req.query;
+      if (!filename || typeof filename !== "string") {
+        res.status(400).json({ error: "Filename is required" });
+        return;
+      }
+
+      // Safeguard against path traversal
+      const safeFilename = path.basename(filename);
+      if (!safeFilename.endsWith(".txt") || safeFilename === ".env.example") {
+        res.status(400).json({ error: "Invalid file type. Only .txt files are allowed." });
+        return;
+      }
+
+      const filePath = path.join(process.cwd(), safeFilename);
+      if (!fs.existsSync(filePath)) {
+        res.status(404).json({ error: "File not found" });
+        return;
+      }
+
+      // Check size limit (e.g. 15MB)
+      const stats = fs.statSync(filePath);
+      if (stats.size > 15 * 1024 * 1024) {
+        res.status(400).json({ error: "File size is too large to load in memory (Max 15MB)." });
+        return;
+      }
+
+      const content = fs.readFileSync(filePath, "utf-8");
+      res.json({ filename: safeFilename, content });
+    } catch (err: any) {
+      console.error("Error reading dictionary file:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Serve static assets / Vite middleware
+  if (process.env.NODE_ENV !== "production") {
+    console.log("Starting server in DEVELOPMENT mode with Vite Middleware...");
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    console.log("Starting server in PRODUCTION mode...");
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server is running at http://0.0.0.0:${PORT}`);
+  });
+}
+
+startServer().catch((error) => {
+  console.error("Failed to start the Express server:", error);
+});

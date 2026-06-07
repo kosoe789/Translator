@@ -309,9 +309,10 @@ export default function App() {
   });
   const [showSyncKey, setShowSyncKey] = useState<boolean>(false);
 
-  // Save API key to localStorage when changed
+  // Save API key to localStorage when changed, and keep cloudSyncKey in perfect alignment!
   useEffect(() => {
     localStorage.setItem("gemini_api_key", customApiKey);
+    setCloudSyncKey(customApiKey);
   }, [customApiKey]);
 
   // Save cloud sync key to localStorage when changed
@@ -333,22 +334,20 @@ export default function App() {
     }
   };
 
-  // Rebuild mergeHistory from scratch: merges local and remote history items robustly on initial sync
+  // Rebuild mergeHistory from scratch: ID/originalText-based Conflict-Free LWW-Element-Set (using tombstones)
   const mergeHistory = (local: HistoryItem[], remote: HistoryItem[]): HistoryItem[] => {
     const map = new Map<string, HistoryItem>();
     
-    // We map remote items first
+    // 1. Process remote items first (including soft-delete tombstones so we can sync deletions correctly)
     remote.forEach(item => {
       if (!item || !item.originalText) return;
-      if (item.isDeleted) return; // Ignore soft-deleted ones from older model
       const key = (item.id || item.originalText).toLowerCase().trim();
       map.set(key, item);
     });
 
-    // We map local items second, resolving conflicts by keeping the one with the newer timestamp
+    // 2. Process local items, keeping whichever item has the newer timestamp
     local.forEach(item => {
       if (!item || !item.originalText) return;
-      if (item.isDeleted) return; // Ignore soft-deleted ones
       const key = (item.id || item.originalText).toLowerCase().trim();
       if (map.has(key)) {
         const existing = map.get(key)!;
@@ -360,10 +359,18 @@ export default function App() {
       }
     });
 
-    return Array.from(map.values()).sort((a, b) => b.timestamp - a.timestamp);
+    // 3. Keep standard capped capacity, but make sure bookmarks aren't pruned
+    const combined = Array.from(map.values()).sort((a, b) => b.timestamp - a.timestamp);
+    if (combined.length > 500) {
+      const bookmarked = combined.filter(item => item.isBookmarked);
+      const nonBookmarked = combined.filter(item => !item.isBookmarked);
+      return [...bookmarked, ...nonBookmarked.slice(0, 200)].sort((a, b) => b.timestamp - a.timestamp);
+    }
+
+    return combined;
   };
 
-  // Saves updated history array directly to the cloud, overwriting the server backup with the user's latest state
+  // Saves updated history array directly to the cloud, doing a safe merge before saving to never lose or overwrite other device's bookmarks
   const handleSaveToCloudDirectly = async (updatedHistory: HistoryItem[]) => {
     // Make sure we update local state first
     setHistory(updatedHistory);
@@ -375,32 +382,8 @@ export default function App() {
     // Mark that initial sync is ready
     hasDoneInitialSyncRef.current = true;
 
-    // Set lock states & sync status
-    isSyncingRef.current = true;
-    isSyncingStateRef.current = true;
-    setIsSyncing(true);
-    setSyncStatus("syncing");
-
-    try {
-      const hash = await computeApiKeyHash(cloudSyncKey);
-      await resilientFetch("/api/sync/save", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
-          apiKeyHash: hash || undefined, 
-          apiKey: cloudSyncKey.trim(), 
-          history: updatedHistory 
-        })
-      });
-      setSyncStatus("synced");
-      setLastSyncedTime(new Date().toLocaleTimeString());
-    } catch (err) {
-      console.error("Direct sync save failed:", err);
-      setSyncStatus("error");
-    } finally {
-      isSyncingStateRef.current = false;
-      setIsSyncing(false);
-    }
+    // Run safe, non-race sync immediately to sync state to server cleanly
+    handleSyncWithCloud(updatedHistory);
   };
 
   // Fetches cloud data and merges it with local storage on startup or key setup
@@ -410,9 +393,8 @@ export default function App() {
       return;
     }
 
-    // Prevent concurrent overlapping requests to avoid state/race corruption
+    // Limit concurrency to avoid state/race corruption on slow connections
     if (isSyncingStateRef.current) {
-      console.log("[Sync] Already in progress, skipping concurrent run.");
       return;
     }
 
@@ -472,7 +454,7 @@ export default function App() {
     }
   };
 
-  // Automatically sync local changes to cloud (with debounce)
+  // Automatically sync local changes to cloud safely
   useEffect(() => {
     if (!cloudSyncKey || !cloudSyncKey.trim()) {
       setSyncStatus("not_configured");
@@ -491,45 +473,62 @@ export default function App() {
     }
 
     const timer = setTimeout(async () => {
-      try {
-        const hash = await computeApiKeyHash(cloudSyncKey);
-        await resilientFetch("/api/sync/save", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ 
-            apiKeyHash: hash || undefined, 
-            apiKey: cloudSyncKey.trim(), 
-            history: history 
-          })
-        });
-        setSyncStatus("synced");
-        setLastSyncedTime(new Date().toLocaleTimeString());
-      } catch (err) {
-        console.error("Auto-sync save failed:", err);
-        setSyncStatus("error");
-      }
-    }, 1500); // 1.5s debounce to group operations together cleanly
+      // Perform a safe, bidirectional fetch-merge-save sync on local updates
+      handleSyncWithCloud(latestHistoryRef.current);
+    }, 1000); // 1.0s debounce to group operations together cleanly
 
     return () => clearTimeout(timer);
   }, [history, cloudSyncKey]);
 
-  // Proactive immediate triggers on interaction/visibility (without resource-wasting 5s loop)
+  // Real-time near-instant bidirectional background polling (visibility-aware and extremely battery-safe)
   useEffect(() => {
     if (!cloudSyncKey || !cloudSyncKey.trim()) return;
 
-    // Immediate action trigger: when tab gets focus, browser wakes up or comes online
-    const triggerSyncOnInteraction = () => {
-      if (document.visibilityState === "visible" && !isTranslatingRef.current && !isSyncingStateRef.current) {
-        console.log("[Sync] Triggered instantaneous sync on wake/focus/online event.");
-        handleSyncWithCloud();
+    let intervalId: NodeJS.Timeout | null = null;
+
+    const startPolling = () => {
+      if (!intervalId) {
+        intervalId = setInterval(() => {
+          if (
+            document.visibilityState === "visible" && 
+            !isTranslatingRef.current && 
+            !isSyncingStateRef.current && 
+            hasDoneInitialSyncRef.current
+          ) {
+            console.log("[Sync] Performing real-time sync poll.");
+            handleSyncWithCloud();
+          }
+        }, 3000); // 3 seconds interval for true real-time cross-device updates
       }
     };
+
+    const stopPolling = () => {
+      if (intervalId) {
+        clearInterval(intervalId);
+        intervalId = null;
+      }
+    };
+
+    // Immediate action trigger: when tab gets focus or comes online
+    const triggerSyncOnInteraction = () => {
+      if (document.visibilityState === "visible") {
+        handleSyncWithCloud();
+        startPolling();
+      } else {
+        stopPolling();
+      }
+    };
+
+    if (document.visibilityState === "visible") {
+      startPolling();
+    }
 
     window.addEventListener("focus", triggerSyncOnInteraction);
     document.addEventListener("visibilitychange", triggerSyncOnInteraction);
     window.addEventListener("online", triggerSyncOnInteraction);
 
     return () => {
+      stopPolling();
       window.removeEventListener("focus", triggerSyncOnInteraction);
       document.removeEventListener("visibilitychange", triggerSyncOnInteraction);
       window.removeEventListener("online", triggerSyncOnInteraction);
