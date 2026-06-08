@@ -31,6 +31,9 @@ import {
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { DictionaryEntry, WorkspaceFile, AnalyzedWord, HistoryItem } from "./types";
+import { auth, googleProvider, db, handleFirestoreError, OperationType } from "./firebase";
+import { onAuthStateChanged, signInWithPopup, signOut, User } from "firebase/auth";
+import { doc, getDoc, setDoc } from "firebase/firestore";
 
 // Pre-loaded elegant small sample E to M dictionary so they can test the app immediately
 const SAMPLE_DICTIONARY: Record<string, string> = {
@@ -88,6 +91,29 @@ const SAMPLE_DICTIONARY: Record<string, string> = {
   "quick": "လျင်မြန်သော (နာမဝိသေသန)",
   "jump": "ခုန်သည် (ကြိယာ)",
   "lazy": "ပျင်းရိသော (နာမဝိသေသန)"
+};
+
+// Resilient safeLocalStorage wrapper to prevent DOMException / SecurityError crashes in sandbox/iframes or private mode
+const safeLocalStorage = {
+  getItem: (key: string): string | null => {
+    try {
+      return localStorage.getItem(key);
+    } catch (e) {
+      console.warn("localStorage is not accessible, using temporary session fallback:", e);
+      return (window as any).__fallback_storage?.[key] || null;
+    }
+  },
+  setItem: (key: string, value: string): void => {
+    try {
+      localStorage.setItem(key, value);
+    } catch (e) {
+      console.warn("localStorage is not accessible, using temporary session fallback:", e);
+      if (!(window as any).__fallback_storage) {
+        (window as any).__fallback_storage = {};
+      }
+      (window as any).__fallback_storage[key] = value;
+    }
+  }
 };
 
 // IndexedDB parameters
@@ -193,6 +219,7 @@ export default function App() {
   const isSyncingRef = useRef(false);
   const isTranslatingRef = useRef(false);
   const isSyncingStateRef = useRef(false);
+  const pendingSyncHistoryRef = useRef<HistoryItem[] | null>(null);
   const [dictionaryMap, setDictionaryMap] = useState<Map<string, string>>(new Map());
   const [dictionarySource, setDictionarySource] = useState<"sample" | "user_file">("sample");
   const [loadedFileName, setLoadedFileName] = useState<string>("");
@@ -223,7 +250,7 @@ export default function App() {
   // History / Logs with local persistence
   const [history, setHistory] = useState<HistoryItem[]>(() => {
     try {
-      const saved = localStorage.getItem("em_translator_history");
+      const saved = safeLocalStorage.getItem("em_translator_history");
       return saved ? JSON.parse(saved) : [];
     } catch {
       return [];
@@ -237,7 +264,7 @@ export default function App() {
   useEffect(() => {
     latestHistoryRef.current = history;
     try {
-      localStorage.setItem("em_translator_history", JSON.stringify(history));
+      safeLocalStorage.setItem("em_translator_history", JSON.stringify(history));
     } catch (err) {
       console.error("Failed to save history to localStorage:", err);
     }
@@ -261,11 +288,11 @@ export default function App() {
   const [isDragging, setIsDragging] = useState(false);
 
   // Admin upload states for Server dictionary files
-  const [passcode, setPasscode] = useState<string>(() => localStorage.getItem("admin_passcode") || "");
+  const [passcode, setPasscode] = useState<string>(() => safeLocalStorage.getItem("admin_passcode") || "");
   
   // Persist passcode changes to localStorage
   useEffect(() => {
-    localStorage.setItem("admin_passcode", passcode);
+    safeLocalStorage.setItem("admin_passcode", passcode);
   }, [passcode]);
 
   const [isUploadingToServer, setIsUploadingToServer] = useState(false);
@@ -292,32 +319,55 @@ export default function App() {
   const [activeRightTab, setActiveRightTab] = useState<"vocab" | "search" | "bookmarks" | "history" | "settings">("vocab");
 
   // Custom API key states
-  const [customApiKey, setCustomApiKey] = useState<string>(() => localStorage.getItem("gemini_api_key") || "");
+  const [customApiKey, setCustomApiKey] = useState<string>(() => safeLocalStorage.getItem("gemini_api_key") || "");
   const [showApiKey, setShowApiKey] = useState<boolean>(false);
 
   // Cloud Sync Key states with backward compatibility
   const [cloudSyncKey, setCloudSyncKey] = useState<string>(() => {
-    const existingSyncKey = localStorage.getItem("cloud_sync_key");
+    const existingSyncKey = safeLocalStorage.getItem("cloud_sync_key");
     if (existingSyncKey) return existingSyncKey;
     // Backward compatibility: if they had a gemini_api_key, copy it as cloud_sync_key so they don't lose sync
-    const existingApiKey = localStorage.getItem("gemini_api_key");
+    const existingApiKey = safeLocalStorage.getItem("gemini_api_key");
     if (existingApiKey) {
-      localStorage.setItem("cloud_sync_key", existingApiKey);
+      safeLocalStorage.setItem("cloud_sync_key", existingApiKey);
       return existingApiKey;
     }
     return "";
   });
   const [showSyncKey, setShowSyncKey] = useState<boolean>(false);
 
-  // Save API key to localStorage when changed, and keep cloudSyncKey in perfect alignment!
+  // Firebase Authentication UI State
+  const [user, setUser] = useState<User | null>(null);
+  const [isAuthLoading, setIsAuthLoading] = useState<boolean>(true);
+
+  // Monitor Google Authentication status to dynamically switch to secure Google Firestore Sync
   useEffect(() => {
-    localStorage.setItem("gemini_api_key", customApiKey);
-    setCloudSyncKey(customApiKey);
-  }, [customApiKey]);
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      setIsAuthLoading(false);
+      if (currentUser) {
+        // User logged in! Set their unique stable Google UID as the cloud sync key
+        setCloudSyncKey(currentUser.uid);
+      } else {
+        // Logged out: restore cloud sync key to the custom API key if present
+        const currentApiKey = safeLocalStorage.getItem("gemini_api_key") || "";
+        setCloudSyncKey(currentApiKey);
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Save API key to localStorage when changed, and keep cloudSyncKey aligned when not authenticated
+  useEffect(() => {
+    safeLocalStorage.setItem("gemini_api_key", customApiKey);
+    if (!user) {
+      setCloudSyncKey(customApiKey);
+    }
+  }, [customApiKey, user]);
 
   // Save cloud sync key to localStorage when changed
   useEffect(() => {
-    localStorage.setItem("cloud_sync_key", cloudSyncKey);
+    safeLocalStorage.setItem("cloud_sync_key", cloudSyncKey);
   }, [cloudSyncKey]);
 
   // Native SHA-256 helper for API key hashing
@@ -334,21 +384,36 @@ export default function App() {
     }
   };
 
-  // Rebuild mergeHistory from scratch: ID/originalText-based Conflict-Free LWW-Element-Set (using tombstones)
+  const areHistoryArraysEqual = (a: HistoryItem[], b: HistoryItem[]): boolean => {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      const itemA = a[i];
+      const itemB = b[i];
+      if (!itemA || !itemB) return false;
+      if (itemA.originalText !== itemB.originalText) return false;
+      if (itemA.translation !== itemB.translation) return false;
+      if (!!itemA.isBookmarked !== !!itemB.isBookmarked) return false;
+      if (!!itemA.isDeleted !== !!itemB.isDeleted) return false;
+      if (itemA.timestamp !== itemB.timestamp) return false;
+    }
+    return true;
+  };
+
+  // Rebuild mergeHistory: originalText-based Conflict-Free LWW-Element-Set (using tombstones)
   const mergeHistory = (local: HistoryItem[], remote: HistoryItem[]): HistoryItem[] => {
     const map = new Map<string, HistoryItem>();
     
     // 1. Process remote items first (including soft-delete tombstones so we can sync deletions correctly)
     remote.forEach(item => {
       if (!item || !item.originalText) return;
-      const key = (item.id || item.originalText).toLowerCase().trim();
+      const key = item.originalText.toLowerCase().trim();
       map.set(key, item);
     });
 
     // 2. Process local items, keeping whichever item has the newer timestamp
     local.forEach(item => {
       if (!item || !item.originalText) return;
-      const key = (item.id || item.originalText).toLowerCase().trim();
+      const key = item.originalText.toLowerCase().trim();
       if (map.has(key)) {
         const existing = map.get(key)!;
         if (item.timestamp >= existing.timestamp) {
@@ -372,7 +437,7 @@ export default function App() {
 
   // Saves updated history array directly to the cloud, doing a safe merge before saving to never lose or overwrite other device's bookmarks
   const handleSaveToCloudDirectly = async (updatedHistory: HistoryItem[]) => {
-    // Make sure we update local state first
+    isSyncingRef.current = true;
     setHistory(updatedHistory);
 
     if (!cloudSyncKey || !cloudSyncKey.trim()) {
@@ -393,8 +458,15 @@ export default function App() {
       return;
     }
 
-    // Limit concurrency to avoid state/race corruption on slow connections
+    // Limit concurrency to avoid state/race corruption on slow connections.
+    // If sync is already active, save latest desired history into the pending ref and return.
+    // When the current active sync finishes in the finally block, it will auto-run the next sync sequentially!
     if (isSyncingStateRef.current) {
+      if (overrideHistory) {
+        pendingSyncHistoryRef.current = overrideHistory;
+      } else {
+        pendingSyncHistoryRef.current = latestHistoryRef.current;
+      }
       return;
     }
 
@@ -402,43 +474,48 @@ export default function App() {
     setIsSyncing(true);
     setSyncStatus("syncing");
     try {
-      const hash = await computeApiKeyHash(cloudSyncKey);
+      console.log("[Sync] Syncing through secure unified server API route...");
+      let remoteHistory: HistoryItem[] = [];
 
-      // 1. Fetch remote data
-      const res = await resilientFetch("/api/sync/get", {
+      const lagRes = await resilientFetch("/api/sync/get", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
-          apiKeyHash: hash || undefined, 
-          apiKey: cloudSyncKey.trim() 
-        })
+        body: JSON.stringify({ apiKey: cloudSyncKey.trim() })
       });
 
-      if (!res.ok) {
-        throw new Error("Failed to contact sync server.");
+      if (lagRes.ok) {
+        const data = await lagRes.json();
+        remoteHistory = data.history || [];
+      } else {
+        throw new Error("Sync server returned error response.");
       }
-
-      const data = await res.json();
-      const remoteHistory = data.history || [];
 
       // 2. Intelligently merge remote history with current history
       const currentLocal = overrideHistory || latestHistoryRef.current;
       const merged = mergeHistory(currentLocal, remoteHistory);
 
-      // 3. Update local state
-      isSyncingRef.current = true;
-      setHistory(merged);
-      
-      // 4. Save merged history to remote to align both perfectly
-      await resilientFetch("/api/sync/save", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
-          apiKeyHash: hash || undefined, 
-          apiKey: cloudSyncKey.trim(), 
-          history: merged 
-        })
-      });
+      // 3. Save only if there's an actual state mutation to avoid loops or redundant I/O
+      const serverNeedsUpdate = !areHistoryArraysEqual(merged, remoteHistory);
+      const localNeedsUpdate = !areHistoryArraysEqual(merged, currentLocal);
+
+      if (localNeedsUpdate) {
+        isSyncingRef.current = true;
+        setHistory(merged);
+      }
+
+      if (serverNeedsUpdate) {
+        const saveRes = await resilientFetch("/api/sync/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            apiKey: cloudSyncKey.trim(),
+            history: merged
+          })
+        });
+        if (!saveRes.ok) {
+          throw new Error("Failed to save merged sync data via server API.");
+        }
+      }
 
       // Confirm that the initial sync is complete
       hasDoneInitialSyncRef.current = true;
@@ -451,6 +528,15 @@ export default function App() {
     } finally {
       isSyncingStateRef.current = false;
       setIsSyncing(false);
+
+      // If a pending sync was queued during execution, consume it now sequentially
+      if (pendingSyncHistoryRef.current !== null) {
+        const nextLocalHistory = pendingSyncHistoryRef.current;
+        pendingSyncHistoryRef.current = null;
+        setTimeout(() => {
+          handleSyncWithCloud(nextLocalHistory);
+        }, 50);
+      }
     }
   };
 
@@ -1323,39 +1409,45 @@ export default function App() {
       setActiveRightTab("vocab");
 
       // Add to history list with bookmark preservation and duplicate filtering
+      // We strip the huge dictionary_definition string from persistent storage to keep payload sizes tiny and avoid localStorage quota limit errors (5MB)
+      const strippedWords = analyzedWordsWithLookups.map((w: any) => ({
+        original: w.original,
+        base: w.base,
+        pos: w.pos,
+        fallback_my: w.fallback_my,
+      }));
+
       const newItem: HistoryItem = {
         id: Date.now().toString(),
         originalText: (data.extractedText || inputText).trim(),
         translation: data.translation,
         timestamp: Date.now(),
         isBookmarked: false,
-        words: analyzedWordsWithLookups,
+        words: strippedWords,
       };
 
-      setHistory((prev) => {
-        // Prevent duplicate items. If the item already exists, preserve its isBookmarked status.
-        const existing = prev.find(
-          (item) => item.originalText.toLowerCase() === newItem.originalText.toLowerCase()
-        );
-        const filtered = prev.filter(
-          (item) => item.originalText.toLowerCase() !== newItem.originalText.toLowerCase()
-        );
-        
-        const itemToInsert: HistoryItem = existing 
-          ? { ...newItem, isBookmarked: existing.isBookmarked, isDeleted: false } 
-          : { ...newItem, isDeleted: false };
+      const existing = history.find(
+        (item) => item.originalText.toLowerCase() === newItem.originalText.toLowerCase()
+      );
+      const filtered = history.filter(
+        (item) => item.originalText.toLowerCase() !== newItem.originalText.toLowerCase()
+      );
+      
+      const itemToInsert: HistoryItem = existing 
+        ? { ...newItem, isBookmarked: existing.isBookmarked, isDeleted: false } 
+        : { ...newItem, isDeleted: false };
 
-        const merged = [itemToInsert, ...filtered];
-        
-        // If history list becomes very large (e.g. > 50), prune excess items that are NOT bookmarked
-        if (merged.length > 50) {
-          const bookmarkedList = merged.filter((item) => item.isBookmarked);
-          const nonBookmarkedList = merged.filter((item) => !item.isBookmarked);
-          // Keep up to 30 recent non-bookmarked items
-          return [...bookmarkedList, ...nonBookmarkedList.slice(0, 30)];
-        }
-        return merged;
-      });
+      let merged = [itemToInsert, ...filtered];
+      
+      // If history list becomes very large (e.g. > 50), prune excess items that are NOT bookmarked
+      if (merged.length > 50) {
+        const bookmarkedList = merged.filter((item) => item.isBookmarked);
+        const nonBookmarkedList = merged.filter((item) => !item.isBookmarked);
+        // Keep up to 30 recent non-bookmarked items
+        merged = [...bookmarkedList, ...nonBookmarkedList.slice(0, 30)];
+      }
+
+      handleSaveToCloudDirectly(merged);
       showSuccess("ဘာသာပြန်ဆိုပြီး ဝါစင်္ဂများကို တိုက်ဆိုင်ရှာဖွေပြီးပါပြီ။");
     } catch (err: any) {
       console.error(err);
@@ -1934,9 +2026,23 @@ export default function App() {
                               className="pt-2.5 first:pt-0 pb-1.5 flex items-start justify-between gap-2 border-b border-dashed border-slate-100 last:border-0 group cursor-pointer"
                               onClick={() => {
                                 setInputText(hist.originalText);
+                                // Dynamically lookup definitions on-the-fly when reading from history/bookmarks to save 99% storage & avoid local quota limit
+                                const wordsWithDefinitions = hist.words.map((w) => {
+                                  if (w.dictionary_definition) return w;
+                                  const baseKey = w.base.toLowerCase().trim().replace(/\d+$/, "");
+                                  let definition = dictionaryMap.get(baseKey);
+                                  if (!definition && w.original) {
+                                    const originalKey = w.original.toLowerCase().trim().replace(/\d+$/, "");
+                                    definition = dictionaryMap.get(originalKey);
+                                  }
+                                  return {
+                                    ...w,
+                                    dictionary_definition: definition || null,
+                                  };
+                                });
                                 setTranslationResult({
                                   translation: hist.translation,
-                                  words: hist.words,
+                                  words: wordsWithDefinitions,
                                 });
                                 setSelectedWordIndex(0);
                                 setActiveRightTab("vocab");
@@ -1959,13 +2065,12 @@ export default function App() {
                                   type="button"
                                   onClick={(e) => {
                                     e.stopPropagation();
-                                    setHistory((prev) =>
-                                      prev.map((item) =>
-                                        item.id === hist.id 
-                                          ? { ...item, isBookmarked: false, timestamp: Date.now() } 
-                                          : item
-                                      )
+                                    const updated = history.map((item) =>
+                                      item.id === hist.id 
+                                        ? { ...item, isBookmarked: false, timestamp: Date.now() } 
+                                        : item
                                     );
+                                    handleSaveToCloudDirectly(updated);
                                     showSuccess("စာမှတ်မှ ဖယ်ထုတ်လိုက်ပါပြီ။");
                                   }}
                                   className="p-1 rounded-md text-slate-400 hover:text-amber-500 hover:bg-slate-50 transition-colors"
@@ -2039,9 +2144,23 @@ export default function App() {
                               className="pt-2.5 first:pt-0 pb-1.5 flex items-start justify-between gap-2 border-b border-dashed border-slate-100 last:border-0 group cursor-pointer"
                               onClick={() => {
                                 setInputText(hist.originalText);
+                                // Dynamically lookup definitions on-the-fly when reading from history/bookmarks to save 99% storage & avoid local quota limit
+                                const wordsWithDefinitions = hist.words.map((w) => {
+                                  if (w.dictionary_definition) return w;
+                                  const baseKey = w.base.toLowerCase().trim().replace(/\d+$/, "");
+                                  let definition = dictionaryMap.get(baseKey);
+                                  if (!definition && w.original) {
+                                    const originalKey = w.original.toLowerCase().trim().replace(/\d+$/, "");
+                                    definition = dictionaryMap.get(originalKey);
+                                  }
+                                  return {
+                                    ...w,
+                                    dictionary_definition: definition || null,
+                                  };
+                                });
                                 setTranslationResult({
                                   translation: hist.translation,
-                                  words: hist.words,
+                                  words: wordsWithDefinitions,
                                 });
                                 setSelectedWordIndex(0);
                                 setActiveRightTab("vocab");
@@ -2075,13 +2194,12 @@ export default function App() {
                                   type="button"
                                   onClick={(e) => {
                                     e.stopPropagation();
-                                    setHistory((prev) =>
-                                      prev.map((item) =>
-                                        item.id === hist.id 
-                                          ? { ...item, isBookmarked: !item.isBookmarked, timestamp: Date.now() } 
-                                          : item
-                                      )
+                                    const updated = history.map((item) =>
+                                      item.id === hist.id 
+                                        ? { ...item, isBookmarked: !item.isBookmarked, timestamp: Date.now() } 
+                                        : item
                                     );
+                                    handleSaveToCloudDirectly(updated);
                                   }}
                                   className={`p-1 rounded-md transition-colors hover:bg-slate-50 ${
                                     hist.isBookmarked 
@@ -2239,21 +2357,92 @@ export default function App() {
                         </div>
 
                         <p className="text-[10.5px] text-slate-600 leading-relaxed md:text-[11px]">
-                          {!customApiKey.trim() ? (
-                            "ဒေတာများကို ဖုန်းနှင့် ကွန်ပျူတာ အချင်းချင်း စင့်ခ်လုပ်ရန်အတွက် အပေါ်ရှိ မိမိကိုယ်ပိုင် Gemini API Key ကို အရင်ဆုံး ဖြည့်သွင်းပေးရန် လိုအပ်ပါသည်။ API Key တူညီစွာ ထည့်သွင်းထားသော မည်သည့်စက်ပစ္စည်း (ဖုန်း/PC) မှမဆို သင်၏ ဘာသာပြန်မှတ်တမ်းများနှင့် Bookmarks များအားလုံးကို တပြိုင်နက်တည်း ချိတ်ဆက်ပေးမည်ဖြစ်ပါသည်။"
+                          {user ? (
+                            "Google အကောင့်ဖြင့် လုံခြုံစိတ်ချစွာ ချိတ်ဆက်ထားပါသည်။ သင်၏ ဘာသာပြန်မှတ်တမ်းများနှင့် စာမှတ်များအားလုံးကို Firestore Durable Database ပေါ်သို့ အမြဲတမ်း သိမ်းဆည်းပေးနေပါပြီ။"
+                          ) : !customApiKey.trim() ? (
+                            "ဒေတာများကို ဖုန်းနှင့် ကွန်ပျူတာ အချင်းချင်း စင့်ခ်လုပ်ရန်အတွက် အောက်ပါအတိုင်း Google အကောင့်ဖြင့် Sign In ဝင်ပြီး သိမ်းဆည်းနိုင်ပါသည် (သို့မဟုတ်) အပေါ်ရှိ မိမိကိုယ်ပိုင် Gemini API Key ကို ဖြည့်သွင်း၍လည်း စင့်ခ်လုပ်နိုင်ပါသည်။"
                           ) : (
                             "ကိုယ်ပိုင် API Key အခြေပြု တိမ်တိုက်စင့်ခ်လှုပ်ရှားမှုမှာ အောင်မြင်စွာ အလုပ်လုပ်နေပါသည်။ သင်၏ ဘာသာပြန်ရလဒ်များ၊ စာမှတ် (Bookmarks) သမိုင်းများကို ဆာဗာသို့ အလိုအလျောက် လုံခြုံစွာ သိမ်းဆည်းလင့်ခ်ပေးနေပါပြီ။"
                           )}
                         </p>
 
-                        {customApiKey.trim() && (
-                          <div className="space-y-2.5">
-                            <div className="flex items-center justify-between text-[11px] border-t border-slate-200/60 pt-2.5 text-slate-550">
-                              <span className="flex items-center gap-1">
-                                <RefreshCw className={`w-3.5 h-3.5 text-indigo-650 ${isSyncing ? "animate-spin" : ""}`} />
+                        {/* Google Authentication Sync Option */}
+                        <div className="border-t border-slate-100 pt-3 mt-2 space-y-2.5">
+                          <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wide">
+                            Google Cloud Account ဖြင့် ချိတ်ဆက်ခြင်း (ရွေးချယ်ရန်)
+                          </label>
+                          {isAuthLoading ? (
+                            <div className="text-[11px] text-slate-500 flex items-center gap-1.5 py-1">
+                              <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-550" /> Load လုပ်နေသည်...
+                            </div>
+                          ) : user ? (
+                            <div className="bg-white border border-slate-150 p-2.5 rounded-lg flex items-center justify-between shadow-xs">
+                              <div className="flex items-center gap-2">
+                                <div className="w-6.5 h-6.5 rounded-full bg-indigo-600 text-white flex items-center justify-center font-bold text-xs select-none">
+                                  {user.email ? user.email.charAt(0).toUpperCase() : "G"}
+                                </div>
+                                <div className="space-y-0.5">
+                                  <p className="text-[11px] font-semibold text-slate-800 leading-tight">{user.displayName || "Google User"}</p>
+                                  <p className="text-[9.5px] text-slate-400 font-mono leading-tight">{user.email}</p>
+                                </div>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={async () => {
+                                  try {
+                                    await signOut(auth);
+                                    showSuccess("Google Account မှ ထွက်လိုက်ပါပြီ။");
+                                  } catch (err: any) {
+                                    console.error(err);
+                                  }
+                                }}
+                                className="text-[10px] font-bold text-rose-600 hover:text-rose-700 bg-rose-50 hover:bg-rose-100/60 px-2.5 py-1 rounded-md transition-all cursor-pointer"
+                              >
+                                Sign Out
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="space-y-2 py-1">
+                              <p className="text-[10.5px] text-slate-550 leading-relaxed font-normal">
+                                Google အကောင့်ဖြင့် Login တစ်ကြိမ်လုပ်ထားရုံဖြင့် မည်သည့် browser, computer သို့ပြောင်းသည်ဖြစ်စေ သင့်၏ စာမှတ်များနှင့် ဝေါဟာရစုများအားလုံး မပျောက်ပျက်တော့ဘဲ အလိုအလျောက် အမြဲသိမ်းဆည်းပေးနေမည် ဖြစ်ပါသည်။
+                              </p>
+                              <button
+                                type="button"
+                                onClick={async () => {
+                                  try {
+                                    const res = await signInWithPopup(auth, googleProvider);
+                                    if (res.user) {
+                                      showSuccess(`မင်္ဂလာပါ ${res.user.displayName || "လူကြီးမင်း"}။ Google ဖြင့် အောင်မြင်စွာ ချိတ်ဆက်ပြီးပါပြီ။`);
+                                    }
+                                  } catch (err: any) {
+                                    console.error(err);
+                                    if (err.code !== "auth/popup-closed-by-user") {
+                                      alert("Login ဝင်ရောက်ရန် မအောင်မြင်ပါ။ ဘရောက်ဆာ popup ပိတ်ထားခြင်း ရှိမရှိ စစ်ဆေးပေးပါ။");
+                                    }
+                                  }
+                                }}
+                                className="w-full flex items-center justify-center gap-2 border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-bold py-2.5 px-3 rounded-lg text-[11px] shadow-xs cursor-pointer active:scale-[0.98] transition-all"
+                              >
+                                <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                  <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/>
+                                  <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
+                                  <path d="M5.84 14.1c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.08H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.92l2.85-2.22.81-.6z" fill="#FBBC05"/>
+                                  <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.08l3.66 2.84c.87-2.6 3.3-4.54 6.16-4.54z" fill="#EA4335"/>
+                                </svg>
+                                Google Account ဖြင့် Sign In ဝင်မည်
+                              </button>
+                            </div>
+                          )}
+                        </div>
+
+                        {(customApiKey.trim() || user) && (
+                          <div className="space-y-2.5 border-t border-slate-100 pt-3">
+                            <div className="flex items-center justify-between text-[11px] text-slate-550">
+                              <span className="flex items-center gap-1.5 font-medium">
+                                <RefreshCw className={`w-3.5 h-3.5 text-indigo-600 ${isSyncing ? "animate-spin" : ""}`} />
                                 Sync အခြေအနေ:
                               </span>
-                              <span className="font-semibold text-slate-800">
+                              <span className="font-semibold text-indigo-700">
                                 {syncStatus === "syncing" && "စင့်ခ်လုပ်နေပါသည်..."}
                                 {syncStatus === "synced" && "Cloud ပေါ်ရှိ ဒေတာများနှင့် တိုက်ဆိုင်ပြီးစီးပါပြီ"}
                                 {syncStatus === "error" && "ဒေတာချိတ်ဆက်ရန် အခက်အခဲရှိနေပါသည်"}
@@ -2263,7 +2452,7 @@ export default function App() {
 
                             {lastSyncedTime && (
                               <div className="flex items-center justify-between text-[11px] text-slate-550">
-                                <span>နောက်ဆုံးစင့်ခ်လုပ်ချိန်:</span>
+                                <span className="font-medium">နောက်ဆုံးစင့်ခ်လုပ်ချိန်:</span>
                                 <span className="font-mono font-semibold text-slate-700">{lastSyncedTime}</span>
                               </div>
                             )}
@@ -2272,7 +2461,7 @@ export default function App() {
                               type="button"
                               disabled={isSyncing}
                               onClick={() => handleSyncWithCloud()}
-                              className="w-full text-xs font-bold bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white py-2 px-4 rounded-lg shadow-sm transition-all cursor-pointer flex items-center justify-center gap-1.5"
+                              className="w-full text-xs font-bold bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white py-2 px-4 rounded-lg shadow-xs transition-all cursor-pointer flex items-center justify-center gap-1.5 active:scale-[0.99]"
                             >
                               <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? "animate-spin" : ""}`} />
                               {isSyncing ? "မိုဘိုင်း/ကွန်ပျူတာ ဒေတာများ ဆွဲယူနေပါသည်..." : "ဒေတာကို ဆာဗာနှင့် ချက်ချင်း စင့်ခ်လုပ်ရန် (Pull & Sync Now)"}

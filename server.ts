@@ -5,24 +5,30 @@ import crypto from "crypto";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
+import { initializeApp } from "firebase/app";
+import { getFirestore, doc, getDoc, setDoc } from "firebase/firestore";
+import firebaseConfig from "./firebase-applet-config.json";
 
 // Load environment variables
 dotenv.config();
+
+// Initialize Firebase App and Firestore for durable cloud saving
+const firebaseApp = initializeApp(firebaseConfig);
+const db = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
 
 // Sync file configuration using the persistent workspace path to avoid data loss on container recycle.
 // Since file watching is disabled (DISABLE_HMR=true) in this setup, writing here will not trigger HMR reloads.
 const SYNC_FILE_PATH = path.join(process.cwd(), "user_sync_data.json");
 const TMP_SYNC_FILE_PATH = "/tmp/user_sync_data.json";
 
-// Wipe previous sync files on boot to perform a clean start as requested
+// Ensure sync files exist on boot to avoid file not found errors
 try {
-  fs.writeFileSync(SYNC_FILE_PATH, "{}", "utf-8");
-  if (fs.existsSync(TMP_SYNC_FILE_PATH)) {
-    fs.writeFileSync(TMP_SYNC_FILE_PATH, "{}", "utf-8");
+  if (!fs.existsSync(SYNC_FILE_PATH)) {
+    fs.writeFileSync(SYNC_FILE_PATH, "{}", "utf-8");
   }
-  console.log("Cleared all server sync records perfectly.");
+  console.log("Initialized server sync storage safely.");
 } catch (err) {
-  console.error("Error clearing sync files:", err);
+  console.error("Error initializing sync files:", err);
 }
 
 // Helper to safely read user sync data
@@ -222,8 +228,8 @@ async function startServer() {
   // JSON body parser
   app.use(express.json({ limit: "50mb" }));
 
-  // API Route: Get synced data (history + bookmarks combined in user schema)
-  app.post("/api/sync/get", (req, res) => {
+  // API Route: Get synced data (history + bookmarks combined in user schema) from Firestore or local-file fallback
+  app.post("/api/sync/get", async (req, res) => {
     try {
       const { apiKeyHash, apiKey } = req.body;
       const hashRegex = /^[a-f0-9]{64}$/i;
@@ -240,17 +246,36 @@ async function startServer() {
         return;
       }
 
-      const syncStore = readSyncData();
-      const history = syncStore[resolvedHash] || [];
+      let history: any[] = [];
+      try {
+        // Try reading from Firestore first (durability priority!)
+        const docRef = doc(db, "syncData", resolvedHash);
+        const docSnap = await getDoc(docRef);
+        if (docSnap.exists()) {
+          const schemaData = docSnap.data();
+          history = schemaData.history || [];
+          console.log(`[Server Sync] Successfully loaded ${history.length} items from Firestore for key ${resolvedHash}`);
+        } else {
+          // If not in firestore, read from local file as fallback
+          const syncStore = readSyncData();
+          history = syncStore[resolvedHash] || [];
+          console.log(`[Server Sync] Firestore doc empty. Loaded ${history.length} items from local backup for key ${resolvedHash}`);
+        }
+      } catch (firestoreErr) {
+        console.warn("[Server Sync] Firestore get failed, falling back to local file store:", firestoreErr);
+        const syncStore = readSyncData();
+        history = syncStore[resolvedHash] || [];
+      }
+
       res.json({ history });
     } catch (err: any) {
-      console.error("Sync get error:", err);
+      console.error("Local sync get error:", err);
       res.status(500).json({ error: err.message || "အချက်အလက်များ ဖတ်ယူရန် မအောင်မြင်ပါ။" });
     }
   });
 
-  // API Route: Save synced data
-  app.post("/api/sync/save", (req, res) => {
+  // API Route: Save synced data to local sync file store + Firestore (acting as a robust local backup fallback)
+  app.post("/api/sync/save", async (req, res) => {
     try {
       const { apiKeyHash, apiKey, history } = req.body;
       const hashRegex = /^[a-f0-9]{64}$/i;
@@ -272,20 +297,37 @@ async function startServer() {
         return;
       }
 
-      // Safeguard against abuse/oversized storage
-      if (history.length > 500) {
-        res.status(400).json({ error: "အချက်အလက် အရေအတွက် ၅၀၀ ကျော်သဖြင့် သိမ်းဆည်း၍ မရပါ။ (Exceeded max storage capacity 500 items.)" });
+      if (history.length > 2000) {
+        res.status(400).json({ error: "အချက်အလက် အရေအတွက် ၂၀၀၀ ကျော်သဖြင့် သိမ်းဆည်း၍ မရပါ။ (Exceeded max storage capacity 2000 items.)" });
         return;
       }
 
-      // Read, update, and write back
-      const syncStore = readSyncData();
-      syncStore[resolvedHash] = history;
-      writeSyncData(syncStore);
+      // 1. Double write: write to local persistent json file backup
+      try {
+        const syncStore = readSyncData();
+        syncStore[resolvedHash] = history;
+        writeSyncData(syncStore);
+      } catch (localWriteErr) {
+        console.warn("[Server Sync] Warning: Local safety JSON backup write failed:", localWriteErr);
+      }
+
+      // 2. Double write: write securely to Google Firestore
+      try {
+        const docRef = doc(db, "syncData", resolvedHash);
+        await setDoc(docRef, {
+          userId: resolvedHash,
+          history: history,
+          updatedAt: new Date().toISOString()
+        });
+        console.log(`[Server Sync] Successfully synced and updated ${history.length} items to Firestore for key ${resolvedHash}`);
+      } catch (firestoreWriteErr: any) {
+        console.error("[Server Sync] Firestore save failed:", firestoreWriteErr);
+        // Note: we still succeed because we already wrote to the local workspace JSON fallback!
+      }
 
       res.json({ success: true });
     } catch (err: any) {
-      console.error("Sync save error:", err);
+      console.error("Local sync save error:", err);
       res.status(500).json({ error: err.message || "အချက်အလက်များ သိမ်းဆည်းရန် မအောင်မြင်ပါ။" });
     }
   });

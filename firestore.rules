@@ -1,0 +1,42 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net: Default Deny All
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper to validate and restrict input IDs
+    function isValidId(id) {
+      return id is string && id.size() <= 128;
+    }
+
+    // Access control for syncData
+    match /syncData/{userId} {
+      allow get: if isValidId(userId) && (
+        (request.auth != null && request.auth.uid == userId) ||
+        userId.matches('^[a-fA-F0-9]{64}$')
+      );
+      
+      allow create, update: if isValidId(userId) && (
+        (request.auth != null && request.auth.uid == userId) ||
+        userId.matches('^[a-fA-F0-9]{64}$')
+      ) && isValidUserSync(request.resource.data);
+
+      allow delete: if isValidId(userId) && (
+        (request.auth != null && request.auth.uid == userId) ||
+        userId.matches('^[a-fA-F0-9]{64}$')
+      );
+    }
+
+    // Validates incoming sync structure
+    function isValidUserSync(data) {
+      return data.keys().hasAll(['userId', 'history', 'updatedAt']) &&
+             data.keys().size() == 3 &&
+             data.userId is string &&
+             data.userId.size() <= 128 &&
+             data.history is list &&
+             data.history.size() <= 2000;
+    }
+  }
+}

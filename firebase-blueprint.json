@@ -1,0 +1,31 @@
+{
+  "entities": {
+    "UserSync": {
+      "title": "UserSync",
+      "description": "Synchronized history and bookmarks for a user, identified by their authenticated UID or a hashed offline sync key",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Firebase UID or hash of the sync key"
+        },
+        "history": {
+          "type": "array",
+          "description": "Complete list of history and bookmarked items"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the collection was last updated"
+        }
+      },
+      "required": ["userId", "history", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/syncData/{userId}": {
+      "schema": "UserSync",
+      "description": "Synchronization endpoint storing the combined history and bookmarked items for each user"
+    }
+  }
+}

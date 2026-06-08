@@ -1,0 +1,31 @@
+{
+  "short_name": "E-M Translator",
+  "name": "E-M Translation & Vocab Reader",
+  "description": "Translate English sentences to Myanmar and automatically analyze words, retrieving definitions from an uploaded English-Myanmar dictionary file.",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "type": "image/svg+xml",
+      "sizes": "any",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon.svg",
+      "type": "image/svg+xml",
+      "sizes": "192x192",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon.svg",
+      "type": "image/svg+xml",
+      "sizes": "512x512",
+      "purpose": "any maskable"
+    }
+  ],
+  "start_url": "/",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
+  "display": "standalone",
+  "orientation": "portrait",
+  "categories": ["education", "utilities"]
+}
