@@ -5,16 +5,9 @@ import crypto from "crypto";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
-import { initializeApp } from "firebase/app";
-import { getFirestore, doc, getDoc, setDoc } from "firebase/firestore";
-import firebaseConfig from "./firebase-applet-config.json";
 
 // Load environment variables
 dotenv.config();
-
-// Initialize Firebase App and Firestore for durable cloud saving
-const firebaseApp = initializeApp(firebaseConfig);
-const db = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
 
 // Sync file configuration using the persistent workspace path to avoid data loss on container recycle.
 // Since file watching is disabled (DISABLE_HMR=true) in this setup, writing here will not trigger HMR reloads.
@@ -228,7 +221,7 @@ async function startServer() {
   // JSON body parser
   app.use(express.json({ limit: "50mb" }));
 
-  // API Route: Get synced data (history + bookmarks combined in user schema) from Firestore or local-file fallback
+  // API Route: Get synced data (history + bookmarks combined in user schema) from local-file backup storage
   app.post("/api/sync/get", async (req, res) => {
     try {
       const { apiKeyHash, apiKey } = req.body;
@@ -246,26 +239,10 @@ async function startServer() {
         return;
       }
 
-      let history: any[] = [];
-      try {
-        // Try reading from Firestore first (durability priority!)
-        const docRef = doc(db, "syncData", resolvedHash);
-        const docSnap = await getDoc(docRef);
-        if (docSnap.exists()) {
-          const schemaData = docSnap.data();
-          history = schemaData.history || [];
-          console.log(`[Server Sync] Successfully loaded ${history.length} items from Firestore for key ${resolvedHash}`);
-        } else {
-          // If not in firestore, read from local file as fallback
-          const syncStore = readSyncData();
-          history = syncStore[resolvedHash] || [];
-          console.log(`[Server Sync] Firestore doc empty. Loaded ${history.length} items from local backup for key ${resolvedHash}`);
-        }
-      } catch (firestoreErr) {
-        console.warn("[Server Sync] Firestore get failed, falling back to local file store:", firestoreErr);
-        const syncStore = readSyncData();
-        history = syncStore[resolvedHash] || [];
-      }
+      // Read from local JSON safety file backup storage (100% stable offline/online!)
+      const syncStore = readSyncData();
+      const history = syncStore[resolvedHash] || [];
+      console.log(`[Server Sync] Loaded ${history.length} items from server file backup for key ${resolvedHash}`);
 
       res.json({ history });
     } catch (err: any) {
@@ -274,7 +251,7 @@ async function startServer() {
     }
   });
 
-  // API Route: Save synced data to local sync file store + Firestore (acting as a robust local backup fallback)
+  // API Route: Save synced data to local sync file store (acting as a robust local backup fallback)
   app.post("/api/sync/save", async (req, res) => {
     try {
       const { apiKeyHash, apiKey, history } = req.body;
@@ -302,28 +279,11 @@ async function startServer() {
         return;
       }
 
-      // 1. Double write: write to local persistent json file backup
-      try {
-        const syncStore = readSyncData();
-        syncStore[resolvedHash] = history;
-        writeSyncData(syncStore);
-      } catch (localWriteErr) {
-        console.warn("[Server Sync] Warning: Local safety JSON backup write failed:", localWriteErr);
-      }
-
-      // 2. Double write: write securely to Google Firestore
-      try {
-        const docRef = doc(db, "syncData", resolvedHash);
-        await setDoc(docRef, {
-          userId: resolvedHash,
-          history: history,
-          updatedAt: new Date().toISOString()
-        });
-        console.log(`[Server Sync] Successfully synced and updated ${history.length} items to Firestore for key ${resolvedHash}`);
-      } catch (firestoreWriteErr: any) {
-        console.error("[Server Sync] Firestore save failed:", firestoreWriteErr);
-        // Note: we still succeed because we already wrote to the local workspace JSON fallback!
-      }
+      // Write to local persistent json file backup (highly reliable and immune to cloud database offline hiccups)
+      const syncStore = readSyncData();
+      syncStore[resolvedHash] = history;
+      writeSyncData(syncStore);
+      console.log(`[Server Sync] Successfully synced and saved ${history.length} items to file-based backup for key ${resolvedHash}`);
 
       res.json({ success: true });
     } catch (err: any) {

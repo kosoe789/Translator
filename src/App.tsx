@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, ChangeEvent, DragEvent } from "reac
 import { 
   BookOpen, 
   Upload, 
+  Download,
   RefreshCw, 
   Languages, 
   HelpCircle, 
@@ -27,13 +28,13 @@ import {
   Clipboard,
   Link as LinkIcon,
   Globe,
-  CloudLightning
+  CloudLightning,
+  DownloadCloud
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { DictionaryEntry, WorkspaceFile, AnalyzedWord, HistoryItem } from "./types";
-import { auth, googleProvider, db, handleFirestoreError, OperationType } from "./firebase";
-import { onAuthStateChanged, signInWithPopup, signOut, User } from "firebase/auth";
-import { doc, getDoc, setDoc } from "firebase/firestore";
+import { auth, googleProvider } from "./firebase";
+import { onAuthStateChanged, signInWithPopup, signOut, User, GoogleAuthProvider } from "firebase/auth";
 
 // Pre-loaded elegant small sample E to M dictionary so they can test the app immediately
 const SAMPLE_DICTIONARY: Record<string, string> = {
@@ -113,24 +114,75 @@ const safeLocalStorage = {
       }
       (window as any).__fallback_storage[key] = value;
     }
+  },
+  removeItem: (key: string): void => {
+    try {
+      localStorage.removeItem(key);
+    } catch (e) {
+      console.warn("localStorage is not accessible, using temporary session fallback:", e);
+      if ((window as any).__fallback_storage) {
+        delete (window as any).__fallback_storage[key];
+      }
+    }
   }
 };
 
 // IndexedDB parameters
 const DB_NAME = "EMDictionaryDB";
 const STORE_NAME = "dictionary_store";
+const HISTORY_STORE_NAME = "history_store";
 
 function openDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 1);
+    // Upgrade to version 2 to create the history_store object store
+    const request = indexedDB.open(DB_NAME, 2);
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains(STORE_NAME)) {
         db.createObjectStore(STORE_NAME, { keyPath: "word" });
       }
+      if (!db.objectStoreNames.contains(HISTORY_STORE_NAME)) {
+        db.createObjectStore(HISTORY_STORE_NAME, { keyPath: "key" });
+      }
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
+  });
+}
+
+function saveHistoryToIndexedDB(historyList: HistoryItem[]): Promise<void> {
+  return openDB().then((db) => {
+    return new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(HISTORY_STORE_NAME, "readwrite");
+      const store = tx.objectStore(HISTORY_STORE_NAME);
+      store.put({ key: "history_list", data: historyList });
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }).catch((err) => {
+    console.warn("Failed to write history list to IndexedDB:", err);
+  });
+}
+
+function loadHistoryFromIndexedDB(): Promise<HistoryItem[]> {
+  return openDB().then((db) => {
+    return new Promise<HistoryItem[]>((resolve, reject) => {
+      if (!db.objectStoreNames.contains(HISTORY_STORE_NAME)) {
+        resolve([]);
+        return;
+      }
+      const tx = db.transaction(HISTORY_STORE_NAME, "readonly");
+      const store = tx.objectStore(HISTORY_STORE_NAME);
+      const request = store.get("history_list");
+      request.onsuccess = () => {
+        const result = request.result;
+        resolve(result ? (result.data || []) : []);
+      };
+      request.onerror = () => reject(request.error);
+    });
+  }).catch((err) => {
+    console.warn("Failed to read history list from IndexedDB fallback:", err);
+    return [];
   });
 }
 
@@ -214,7 +266,7 @@ export default function App() {
   // Inputs
   const [inputText, setInputText] = useState("");
   const [isSyncing, setIsSyncing] = useState(false);
-  const [syncStatus, setSyncStatus] = useState<"not_configured" | "synced" | "syncing" | "error">("not_configured");
+  const [syncStatus, setSyncStatus] = useState<"not_configured" | "synced" | "syncing" | "error" | "unauthorized">("not_configured");
   const [lastSyncedTime, setLastSyncedTime] = useState<string | null>(null);
   const isSyncingRef = useRef(false);
   const isTranslatingRef = useRef(false);
@@ -247,11 +299,26 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResult, setSearchResult] = useState<string | null>(null);
 
+  // Strips the huge dictionary_definition string from persistent storage to keep payload sizes tiny and avoid localStorage quota limit errors (5MB)
+  // Also permanently purges deleted items so that "Clear" / "Delete" actions are final and never backed up/restored to/from Google Drive.
+  const sanitizeHistoryItems = (items: HistoryItem[]): HistoryItem[] => {
+    if (!Array.isArray(items)) return [];
+    return items
+      .filter((item) => item && !item.isDeleted)
+      .map((item) => ({
+        ...item,
+        words: item.words ? item.words.map((w: any) => {
+          const { dictionary_definition, ...rest } = w;
+          return rest;
+        }) : [],
+      }));
+  };
+
   // History / Logs with local persistence
   const [history, setHistory] = useState<HistoryItem[]>(() => {
     try {
       const saved = safeLocalStorage.getItem("em_translator_history");
-      return saved ? JSON.parse(saved) : [];
+      return saved ? sanitizeHistoryItems(JSON.parse(saved)) : [];
     } catch {
       return [];
     }
@@ -262,13 +329,45 @@ export default function App() {
   const hasDoneInitialSyncRef = useRef<boolean>(false);
 
   useEffect(() => {
-    latestHistoryRef.current = history;
+    const sanitized = sanitizeHistoryItems(history);
+    latestHistoryRef.current = sanitized;
     try {
-      safeLocalStorage.setItem("em_translator_history", JSON.stringify(history));
+      safeLocalStorage.setItem("em_translator_history", JSON.stringify(sanitized));
     } catch (err) {
       console.error("Failed to save history to localStorage:", err);
     }
+    // Double-write to IndexedDB for offline durability in partitioned sandboxed frames
+    saveHistoryToIndexedDB(sanitized);
   }, [history]);
+
+  // Load initial history from IndexedDB on startup (bypasses iframe sandbox localStorage wiped on re-load issue)
+  useEffect(() => {
+    loadHistoryFromIndexedDB()
+      .then((idbHistory) => {
+        if (idbHistory && idbHistory.length > 0) {
+          const sanitizedIdb = sanitizeHistoryItems(idbHistory);
+          setHistory((prev) => {
+            const existingIds = new Set(prev.map(x => x.id));
+            const merged = [...prev];
+            let addedCount = 0;
+            sanitizedIdb.forEach(item => {
+              if (!existingIds.has(item.id)) {
+                merged.push(item);
+                addedCount++;
+              }
+            });
+            if (addedCount > 0) {
+              console.log(`[IndexedDB] Restored ${addedCount} historical/bookmark items into session.`);
+              return sanitizeHistoryItems(merged).sort((a, b) => b.timestamp - a.timestamp);
+            }
+            return prev;
+          });
+        }
+      })
+      .catch((err) => {
+        console.warn("Failed to execute early IndexedDB history restore:", err);
+      });
+  }, []);
 
   useEffect(() => {
     isTranslatingRef.current = isTranslating;
@@ -314,6 +413,7 @@ export default function App() {
   const [selectedImageName, setSelectedImageName] = useState("");
   const [selectedImageMime, setSelectedImageMime] = useState("");
   const imageInputRef = useRef<HTMLInputElement>(null);
+  const backupInputRef = useRef<HTMLInputElement>(null);
 
   // Tab State for right-sidebar content
   const [activeRightTab, setActiveRightTab] = useState<"vocab" | "search" | "bookmarks" | "history" | "settings">("vocab");
@@ -339,8 +439,36 @@ export default function App() {
   // Firebase Authentication UI State
   const [user, setUser] = useState<User | null>(null);
   const [isAuthLoading, setIsAuthLoading] = useState<boolean>(true);
+  const [googleDriveToken, setGoogleDriveToken] = useState<string | null>(() => {
+    try {
+      const stored = safeLocalStorage.getItem("google_drive_token_info");
+      if (stored) {
+        const { token } = JSON.parse(stored);
+        if (token) {
+          console.log("[Auth] Restoring Google Drive token from persistent storage...");
+          return token;
+        }
+      }
+    } catch (e) {
+      console.warn("Failed to read google_drive_token_info from localStorage:", e);
+    }
+    return null;
+  });
 
-  // Monitor Google Authentication status to dynamically switch to secure Google Firestore Sync
+  const updateGoogleDriveToken = (token: string | null) => {
+    setGoogleDriveToken(token);
+    if (token) {
+      const tokenData = {
+        token: token,
+        expiresAt: Date.now() + 365 * 24 * 3600 * 1000 // Persistent fallback
+      };
+      safeLocalStorage.setItem("google_drive_token_info", JSON.stringify(tokenData));
+    } else {
+      safeLocalStorage.removeItem("google_drive_token_info");
+    }
+  };
+
+  // Monitor Google Authentication status to dynamically switch to secure Google Firestore Sync / Google Drive Sync
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
       setUser(currentUser);
@@ -352,6 +480,7 @@ export default function App() {
         // Logged out: restore cloud sync key to the custom API key if present
         const currentApiKey = safeLocalStorage.getItem("gemini_api_key") || "";
         setCloudSyncKey(currentApiKey);
+        updateGoogleDriveToken(null);
       }
     });
     return () => unsubscribe();
@@ -401,17 +530,19 @@ export default function App() {
 
   // Rebuild mergeHistory: originalText-based Conflict-Free LWW-Element-Set (using tombstones)
   const mergeHistory = (local: HistoryItem[], remote: HistoryItem[]): HistoryItem[] => {
+    const sanitizedLocal = sanitizeHistoryItems(local);
+    const sanitizedRemote = sanitizeHistoryItems(remote);
     const map = new Map<string, HistoryItem>();
     
     // 1. Process remote items first (including soft-delete tombstones so we can sync deletions correctly)
-    remote.forEach(item => {
+    sanitizedRemote.forEach(item => {
       if (!item || !item.originalText) return;
       const key = item.originalText.toLowerCase().trim();
       map.set(key, item);
     });
 
     // 2. Process local items, keeping whichever item has the newer timestamp
-    local.forEach(item => {
+    sanitizedLocal.forEach(item => {
       if (!item || !item.originalText) return;
       const key = item.originalText.toLowerCase().trim();
       if (map.has(key)) {
@@ -429,16 +560,17 @@ export default function App() {
     if (combined.length > 500) {
       const bookmarked = combined.filter(item => item.isBookmarked);
       const nonBookmarked = combined.filter(item => !item.isBookmarked);
-      return [...bookmarked, ...nonBookmarked.slice(0, 200)].sort((a, b) => b.timestamp - a.timestamp);
+      return sanitizeHistoryItems([...bookmarked, ...nonBookmarked.slice(0, 200)]).sort((a, b) => b.timestamp - a.timestamp);
     }
 
-    return combined;
+    return sanitizeHistoryItems(combined);
   };
 
   // Saves updated history array directly to the cloud, doing a safe merge before saving to never lose or overwrite other device's bookmarks
   const handleSaveToCloudDirectly = async (updatedHistory: HistoryItem[]) => {
+    const sanitized = sanitizeHistoryItems(updatedHistory);
     isSyncingRef.current = true;
-    setHistory(updatedHistory);
+    setHistory(sanitized);
 
     if (!cloudSyncKey || !cloudSyncKey.trim()) {
       return;
@@ -448,12 +580,122 @@ export default function App() {
     hasDoneInitialSyncRef.current = true;
 
     // Run safe, non-race sync immediately to sync state to server cleanly
-    handleSyncWithCloud(updatedHistory);
+    handleSyncWithCloud(sanitized);
+  };
+
+  // Synchronizes history with Google Drive using the private and secure backup JSON file
+  const handleGoogleDriveSync = async (token: string, currentLocal: HistoryItem[]): Promise<{ merged: HistoryItem[], remoteHistory: HistoryItem[] }> => {
+    const q = "name = 'dictionary_sync_backup.json' and trashed = false";
+    const searchUrl = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=${encodeURIComponent("files(id, name)")}`;
+    
+    const searchRes = await resilientFetch(searchUrl, {
+      headers: { "Authorization": `Bearer ${token}` }
+    });
+    if (!searchRes.ok) {
+      if (searchRes.status === 401) {
+        updateGoogleDriveToken(null);
+        throw new Error("Google Drive login session expired. Please re-authorize.");
+      }
+      throw new Error(`Google Drive search failed: ${searchRes.statusText}`);
+    }
+    const searchData = await searchRes.json();
+    const files = searchData.files || [];
+
+    let fileId = "";
+    let remoteHistory: HistoryItem[] = [];
+
+    if (files.length > 0) {
+      fileId = files[0].id;
+      // Download the backup file alt=media contents
+      const getContentUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
+      const contentRes = await resilientFetch(getContentUrl, {
+        headers: { "Authorization": `Bearer ${token}` }
+      });
+      if (!contentRes.ok) {
+        throw new Error(`Google Drive download failed: ${contentRes.statusText}`);
+      }
+      // Safety fix: handle blank/0-byte empty file cases without crashing JSON parse
+      const text = await contentRes.text();
+      if (text && text.trim()) {
+        try {
+          const remoteData = JSON.parse(text);
+          remoteHistory = remoteData.history || [];
+          console.log(`[Google Drive Sync] Successfully read backup file with ${remoteHistory.length} items.`);
+        } catch (jsonErr) {
+          console.warn("[Google Drive Sync] Empty or invalid JSON content in Google Drive sync file, treating as empty history.", jsonErr);
+        }
+      } else {
+        console.log("[Google Drive Sync] Backup file is currently blank (0 bytes). Proceeding with empty remote base.");
+      }
+    }
+
+    const merged = mergeHistory(currentLocal, remoteHistory);
+    const driveNeedsUpdate = !areHistoryArraysEqual(merged, remoteHistory);
+
+    if (driveNeedsUpdate) {
+      if (fileId) {
+        // Overwrite the Google Drive media file with PUT/PATCH
+        const updateUrl = `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`;
+        const saveRes = await resilientFetch(updateUrl, {
+          method: "PATCH",
+          headers: {
+            "Authorization": `Bearer ${token}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ history: merged })
+        });
+        if (!saveRes.ok) {
+          throw new Error(`Failed to update sync file on Google Drive: ${saveRes.statusText}`);
+        }
+        console.log(`[Google Drive Sync] Successfully updated backup file with ${merged.length} items.`);
+      } else {
+        // Step 1: Create the metadata first
+        const createMetadataUrl = "https://www.googleapis.com/drive/v3/files";
+        const metadataRes = await resilientFetch(createMetadataUrl, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${token}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            name: "dictionary_sync_backup.json",
+            mimeType: "application/json"
+          })
+        });
+        if (!metadataRes.ok) {
+          throw new Error(`Failed to create Google Drive sync metadata: ${metadataRes.statusText}`);
+        }
+        const createdFile = await metadataRes.json();
+        const newFileId = createdFile.id;
+
+        // Step 2: Push content to the created file ID
+        const uploadUrl = `https://www.googleapis.com/upload/drive/v3/files/${newFileId}?uploadType=media`;
+        const saveRes = await resilientFetch(uploadUrl, {
+          method: "PATCH",
+          headers: {
+            "Authorization": `Bearer ${token}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ history: merged })
+        });
+        if (!saveRes.ok) {
+          throw new Error(`Failed to upload Google Drive content: ${saveRes.statusText}`);
+        }
+        console.log(`[Google Drive Sync] Created new backup file and uploaded ${merged.length} items.`);
+      }
+    }
+
+    return { merged, remoteHistory };
   };
 
   // Fetches cloud data and merges it with local storage on startup or key setup
   const handleSyncWithCloud = async (overrideHistory?: HistoryItem[]) => {
-    if (!cloudSyncKey || !cloudSyncKey.trim()) {
+    if (user) {
+      if (!googleDriveToken) {
+        setSyncStatus("unauthorized");
+        return;
+      }
+    } else if (!cloudSyncKey || !cloudSyncKey.trim()) {
       setSyncStatus("not_configured");
       return;
     }
@@ -474,47 +716,54 @@ export default function App() {
     setIsSyncing(true);
     setSyncStatus("syncing");
     try {
-      console.log("[Sync] Syncing through secure unified server API route...");
       let remoteHistory: HistoryItem[] = [];
+      let merged: HistoryItem[] = [];
+      const currentLocal = overrideHistory || latestHistoryRef.current;
 
-      const lagRes = await resilientFetch("/api/sync/get", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ apiKey: cloudSyncKey.trim() })
-      });
-
-      if (lagRes.ok) {
-        const data = await lagRes.json();
-        remoteHistory = data.history || [];
+      if (user && googleDriveToken) {
+        console.log("[Sync] Syncing through Google Drive...");
+        const gdResult = await handleGoogleDriveSync(googleDriveToken, currentLocal);
+        merged = gdResult.merged;
+        remoteHistory = gdResult.remoteHistory;
       } else {
-        throw new Error("Sync server returned error response.");
+        console.log("[Sync] Syncing through secure unified server API route...");
+        const lagRes = await resilientFetch("/api/sync/get", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ apiKey: cloudSyncKey.trim() })
+        });
+
+        if (lagRes.ok) {
+          const data = await lagRes.json();
+          remoteHistory = data.history || [];
+        } else {
+          throw new Error("Sync server returned error response.");
+        }
+
+        // Intelligently merge remote history with current history
+        merged = mergeHistory(currentLocal, remoteHistory);
+
+        // Save only if there's an actual state mutation to avoid loops or redundant I/O
+        const serverNeedsUpdate = !areHistoryArraysEqual(merged, remoteHistory);
+        if (serverNeedsUpdate) {
+          const saveRes = await resilientFetch("/api/sync/save", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              apiKey: cloudSyncKey.trim(),
+              history: merged
+            })
+          });
+          if (!saveRes.ok) {
+            throw new Error("Failed to save merged sync data via server API.");
+          }
+        }
       }
 
-      // 2. Intelligently merge remote history with current history
-      const currentLocal = overrideHistory || latestHistoryRef.current;
-      const merged = mergeHistory(currentLocal, remoteHistory);
-
-      // 3. Save only if there's an actual state mutation to avoid loops or redundant I/O
-      const serverNeedsUpdate = !areHistoryArraysEqual(merged, remoteHistory);
       const localNeedsUpdate = !areHistoryArraysEqual(merged, currentLocal);
-
       if (localNeedsUpdate) {
         isSyncingRef.current = true;
         setHistory(merged);
-      }
-
-      if (serverNeedsUpdate) {
-        const saveRes = await resilientFetch("/api/sync/save", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            apiKey: cloudSyncKey.trim(),
-            history: merged
-          })
-        });
-        if (!saveRes.ok) {
-          throw new Error("Failed to save merged sync data via server API.");
-        }
       }
 
       // Confirm that the initial sync is complete
@@ -542,7 +791,7 @@ export default function App() {
 
   // Automatically sync local changes to cloud safely
   useEffect(() => {
-    if (!cloudSyncKey || !cloudSyncKey.trim()) {
+    if (!googleDriveToken && (!cloudSyncKey || !cloudSyncKey.trim())) {
       setSyncStatus("not_configured");
       return;
     }
@@ -564,11 +813,11 @@ export default function App() {
     }, 1000); // 1.0s debounce to group operations together cleanly
 
     return () => clearTimeout(timer);
-  }, [history, cloudSyncKey]);
+  }, [history, cloudSyncKey, googleDriveToken]);
 
-  // Real-time near-instant bidirectional background polling (visibility-aware and extremely battery-safe)
+  // Real-time bidirectional background polling (visibility-aware and extremely battery-safe)
   useEffect(() => {
-    if (!cloudSyncKey || !cloudSyncKey.trim()) return;
+    if (!googleDriveToken && (!cloudSyncKey || !cloudSyncKey.trim())) return;
 
     let intervalId: NodeJS.Timeout | null = null;
 
@@ -584,7 +833,7 @@ export default function App() {
             console.log("[Sync] Performing real-time sync poll.");
             handleSyncWithCloud();
           }
-        }, 3000); // 3 seconds interval for true real-time cross-device updates
+        }, 30000); // Throttled to 30 seconds for optimal battery/network safety, avoiding constant spins
       }
     };
 
@@ -619,25 +868,25 @@ export default function App() {
       document.removeEventListener("visibilitychange", triggerSyncOnInteraction);
       window.removeEventListener("online", triggerSyncOnInteraction);
     };
-  }, [cloudSyncKey]);
+  }, [cloudSyncKey, googleDriveToken]);
 
   // Trigger immediate sync update when user tab switches to history or bookmarks so they see computer's data instantly
   useEffect(() => {
     if (activeRightTab === "history" || activeRightTab === "bookmarks") {
-      if (cloudSyncKey && cloudSyncKey.trim() && !isTranslatingRef.current && !isSyncingStateRef.current) {
+      if ((googleDriveToken || (cloudSyncKey && cloudSyncKey.trim())) && !isTranslatingRef.current && !isSyncingStateRef.current) {
         handleSyncWithCloud();
       }
     }
-  }, [activeRightTab, cloudSyncKey]);
+  }, [activeRightTab, cloudSyncKey, googleDriveToken]);
 
-  // Sync automatically upon initial load or when cloudSyncKey changes
+  // Sync automatically upon initial load or when cloudSyncKey or googleDriveToken changes
   useEffect(() => {
-    if (cloudSyncKey && cloudSyncKey.trim()) {
+    if (googleDriveToken || (cloudSyncKey && cloudSyncKey.trim())) {
       handleSyncWithCloud();
     } else {
       setSyncStatus("not_configured");
     }
-  }, [cloudSyncKey]);
+  }, [cloudSyncKey, googleDriveToken]);
 
   // Initial load: Fetch server dictionary files and check IndexedDB
   useEffect(() => {
@@ -1032,6 +1281,148 @@ export default function App() {
     } finally {
       setIsLoadingServerFile(null);
     }
+  };
+
+  // Export History / Bookmarks to a local JSON file
+  const handleExportDataFile = () => {
+    try {
+      if (history.length === 0) {
+        showError("တင်ပို့ရန် မှတ်တမ်း သို့မဟုတ် စာမှတ်ဒေတာများ မရှိသေးပါ။ (No data to export.)");
+        return;
+      }
+      const dataStr = JSON.stringify(history, null, 2);
+      const dataUri = 'data:application/json;charset=utf-8,'+ encodeURIComponent(dataStr);
+      const exportFileDefaultName = `dictionary_translator_backup_${new Date().toISOString().slice(0,10)}.json`;
+
+      const linkElement = document.createElement('a');
+      linkElement.setAttribute('href', dataUri);
+      linkElement.setAttribute('download', exportFileDefaultName);
+      linkElement.click();
+      
+      showSuccess("စာမှတ်နှင့် ဘာသာပြန်မှတ်တမ်းဒေတာများကို Backup ဖိုင် (.json) အဖြစ် အောင်မြင်စွာ ထုတ်ယူသိမ်းဆည်းပြီးပါပြီ။");
+    } catch (err: any) {
+      showError("Backup ထုတ်ယူရန် မအောင်မြင်ပါ: " + err.message);
+    }
+  };
+
+  // Import History / Bookmarks from a local JSON file
+  const handleImportDataFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (!file.name.endsWith(".json")) {
+      showError("ကျေးဇူးပြု၍ .json backup file အမျိုးအစားကိုသာ ရွေးချယ်တင်သွင်းပါ။");
+      e.target.value = "";
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const text = event.target?.result;
+        if (typeof text !== "string") {
+          throw new Error("ဖိုင်ဖတ်ရန် မအောင်မြင်ပါ။");
+        }
+
+        const parsedRaw = JSON.parse(text) as HistoryItem[];
+        const parsed = sanitizeHistoryItems(parsedRaw);
+        if (!Array.isArray(parsed)) {
+          throw new Error("Backup ဖိုင် ပြည့်စုံမှုမရှိပါ။ သတ်မှတ်ထားသော စာရင်းပုံစံမဟုတ်ပါ။");
+        }
+
+        // Simple validation to check if items look like HistoryItem
+        const isValid = parsed.every(item => item && typeof item === "object" && 'originalText' in item && 'translation' in item);
+        if (!isValid && parsed.length > 0) {
+          throw new Error("Backup ဖိုင်အတွင်းရှိ ဒေတာပုံစံ မမှန်ကန်ပါ။");
+        }
+
+        // Intelligent merge
+        const existingMap = new Map<string, HistoryItem>(history.map(item => [item.id, item]));
+        let newItemsAdded = 0;
+        let restoredDeleted = 0;
+        let bookmarksSynced = 0;
+        let totalProcessed = 0;
+
+        parsed.forEach((item: HistoryItem) => {
+          totalProcessed++;
+          const existing = existingMap.get(item.id);
+          if (!existing) {
+            // If item exists in the backup, treat it as active by default unless explicitly deleted in backup
+            existingMap.set(item.id, {
+              ...item,
+              isDeleted: item.isDeleted ?? false,
+              isBookmarked: item.isBookmarked ?? false
+            });
+            newItemsAdded++;
+          } else {
+            let itemChanged = false;
+            let finalIsBookmarked = existing.isBookmarked || item.isBookmarked || false;
+            let finalIsDeleted = existing.isDeleted;
+
+            // If it was deleted locally but active/present in backup, restore it!
+            if (existing.isDeleted && !item.isDeleted) {
+              finalIsDeleted = false;
+              restoredDeleted++;
+              itemChanged = true;
+            }
+
+            if (!existing.isBookmarked && item.isBookmarked) {
+              bookmarksSynced++;
+              itemChanged = true;
+            }
+
+            const latestTimestamp = Math.max(existing.timestamp, item.timestamp);
+            if (latestTimestamp !== existing.timestamp) {
+              itemChanged = true;
+            }
+
+            if (itemChanged || finalIsBookmarked !== existing.isBookmarked || finalIsDeleted !== existing.isDeleted) {
+              existingMap.set(item.id, {
+                ...existing,
+                ...item,
+                isBookmarked: finalIsBookmarked,
+                isDeleted: finalIsDeleted,
+                timestamp: latestTimestamp
+              });
+            }
+          }
+        });
+
+        const merged = Array.from(existingMap.values()).sort((a, b) => b.timestamp - a.timestamp);
+        const sanitizedMerged = sanitizeHistoryItems(merged);
+        
+        // Update local memory and double write to IndexedDB immediately for sandbox durability
+        setHistory(sanitizedMerged);
+        saveHistoryToIndexedDB(sanitizedMerged);
+        handleSaveToCloudDirectly(sanitizedMerged);
+
+        // Detailed success report indicating what was actually imported/restored
+        let feedbackMessage = `Backup ဖိုင်ထဲမှ ဒေတာ ${totalProcessed} ခုကို တင်သွင်းပြီးပါပြီ။ `;
+        
+        const details: string[] = [];
+        if (newItemsAdded > 0) {
+          details.push(`ဝေါဟာရအသစ် ${newItemsAdded} ခု နောက်ဆုံးမှတ်တမ်းထဲ ထပ်တိုးလိုက်သည်`);
+        }
+        if (restoredDeleted > 0) {
+          details.push(`ဖျက်ထားမိသော မှတ်တမ်းဟောင်း ${restoredDeleted} ခုကို ပြန်လည် ဆယ်ယူလိုက်သည်`);
+        }
+        if (bookmarksSynced > 0) {
+          details.push(`စာမှတ်အသစ် ${bookmarksSynced} ခု ပေါင်းစည်းလိုက်သည်`);
+        }
+        
+        if (details.length > 0) {
+          feedbackMessage += `(` + details.join("၊ ") + `) ဒေတာများ ချက်ချင်း ဝင်ရောက် အလုပ်လုပ်သွားပါပြီ။`;
+        } else {
+          feedbackMessage += `(စီစစ်မှုအရ ဒေတာအသစ်မရှိပါ၊ သင့်စက်ရှိ လက်ရှိမှတ်တမ်းများနှင့် အကုန်လုံး ကိုက်ညီနေပြီး ဖြစ်ပါသည်)`;
+        }
+
+        showSuccess(feedbackMessage);
+      } catch (err: any) {
+        showError("ဒေတာ ပြန်သွင်းရန် မအောင်မြင်ပါ: " + err.message);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
   };
 
   // Load an uploaded local file
@@ -2026,7 +2417,6 @@ export default function App() {
                               className="pt-2.5 first:pt-0 pb-1.5 flex items-start justify-between gap-2 border-b border-dashed border-slate-100 last:border-0 group cursor-pointer"
                               onClick={() => {
                                 setInputText(hist.originalText);
-                                // Dynamically lookup definitions on-the-fly when reading from history/bookmarks to save 99% storage & avoid local quota limit
                                 const wordsWithDefinitions = hist.words.map((w) => {
                                   if (w.dictionary_definition) return w;
                                   const baseKey = w.base.toLowerCase().trim().replace(/\d+$/, "");
@@ -2048,19 +2438,22 @@ export default function App() {
                                 setActiveRightTab("vocab");
                               }}
                             >
-                              <div className="min-w-0 flex-1 space-y-0.5">
-                                <p className="text-xs font-semibold text-slate-755 group-hover:text-indigo-600 truncate">
-                                  {hist.originalText}
-                                </p>
-                                <p className="text-xs text-emerald-600 truncate font-medium">
+                              <div className="min-w-0 flex-1 space-y-0.5 font-sans">
+                                <div className="flex items-center gap-1.5 min-w-0 font-sans">
+                                  <Star className="w-3.5 h-3.5 fill-amber-400 stroke-amber-400 shrink-0" />
+                                  <p className="text-xs font-semibold text-slate-755 group-hover:text-indigo-600 truncate font-sans">
+                                    {hist.originalText}
+                                  </p>
+                                </div>
+                                <p className="text-xs text-emerald-600 truncate font-medium font-sans">
                                   {hist.translation}
                                 </p>
-                                <p className="text-[9px] text-slate-400 font-mono">
-                                  {new Date(hist.timestamp).toLocaleDateString()} {new Date(hist.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                                <p className="text-[9px] text-slate-400 font-mono flex items-center gap-1.5 font-sans">
+                                  <span>{new Date(hist.timestamp).toLocaleDateString()} {new Date(hist.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
                                 </p>
                               </div>
                               
-                              <div className="flex items-center gap-1 shrink-0 opacity-80 group-hover:opacity-100 transition-opacity">
+                              <div className="flex items-center gap-1 shrink-0 opacity-80 group-hover:opacity-100 transition-opacity font-sans">
                                 <button
                                   type="button"
                                   onClick={(e) => {
@@ -2085,8 +2478,8 @@ export default function App() {
                       ) : (
                         <div className="text-center py-12 text-slate-400">
                           <Star className="w-8 h-8 mx-auto stroke-1 mb-1 text-slate-350" />
-                          <p className="text-xs font-bold text-slate-550 mr-1.5">စာမှတ်ပြုလုပ်ထားသည်များ မရှိသေးပါ။</p>
-                          <p className="text-[10.5px] text-slate-400 mt-1 md:px-6 leading-relaxed">မှတ်တမ်း (History) tab မှ ဝါကျများကို ကြယ်ပွင့်ပုံစံနှိပ်၍ စာမှတ်အဖြစ် သိမ်းဆည်းရန် ဖြစ်ပါသည်။</p>
+                          <p className="text-xs font-bold text-slate-550 mr-1.5 font-sans">စာမှတ်ပြုလုပ်ထားသည်များ မရှိသေးပါ။</p>
+                          <p className="text-[10.5px] text-slate-400 mt-1 md:px-6 leading-relaxed font-sans">မှတ်တမ်း (History) tab မှ ဝါကျများကို ကြယ်ပွင့်ပုံစံနှိပ်၍ စာမှတ်အဖြစ် သိမ်းဆည်းရန် ဖြစ်ပါသည်။</p>
                         </div>
                       )}
                     </motion.div>
@@ -2128,7 +2521,7 @@ export default function App() {
                                 showSuccess("ဖျက်ရန် သမိုင်းမှတ်တမ်းအသစ် မရှိသေးပါ။");
                               }
                             }}
-                            className="text-[9px] text-rose-600 hover:text-rose-700 bg-rose-50 hover:bg-rose-100 px-2 py-0.5 rounded transition-all font-bold cursor-pointer"
+                            className="text-[9px] text-rose-600 hover:text-rose-700 bg-rose-50 hover:bg-rose-100 px-2 py-0.5 rounded transition-all font-bold cursor-pointer font-sans"
                             title="Bookmark ပြုလုပ်ထားသော အရာများကို ချန်လှပ်၍ ကျန်ရှိသမျှကို ရှင်းလင်းပါမည်"
                           >
                             ရှင်းလင်းရန်
@@ -2144,7 +2537,6 @@ export default function App() {
                               className="pt-2.5 first:pt-0 pb-1.5 flex items-start justify-between gap-2 border-b border-dashed border-slate-100 last:border-0 group cursor-pointer"
                               onClick={() => {
                                 setInputText(hist.originalText);
-                                // Dynamically lookup definitions on-the-fly when reading from history/bookmarks to save 99% storage & avoid local quota limit
                                 const wordsWithDefinitions = hist.words.map((w) => {
                                   if (w.dictionary_definition) return w;
                                   const baseKey = w.base.toLowerCase().trim().replace(/\d+$/, "");
@@ -2166,30 +2558,29 @@ export default function App() {
                                 setActiveRightTab("vocab");
                               }}
                             >
-                              <div className="min-w-0 flex-1 space-y-0.5">
-                                <div className="flex items-center gap-1.5 min-w-0">
+                              <div className="min-w-0 flex-1 space-y-0.5 font-sans">
+                                <div className="flex items-center gap-1.5 min-w-0 font-sans">
                                   {hist.isBookmarked && (
                                     <Star className="w-3.5 h-3.5 fill-amber-400 stroke-amber-400 shrink-0" />
                                   )}
-                                  <p className="text-xs font-semibold text-slate-755 group-hover:text-indigo-600 truncate">
+                                  <p className="text-xs font-semibold text-slate-755 group-hover:text-indigo-600 truncate font-sans">
                                     {hist.originalText}
                                   </p>
                                 </div>
-                                <p className="text-xs text-emerald-600 truncate font-medium">
+                                <p className="text-xs text-emerald-600 truncate font-medium font-sans">
                                   {hist.translation}
                                 </p>
-                                <p className="text-[9px] text-slate-400 font-mono flex items-center gap-1.5">
-                                  <span>{new Date(hist.timestamp).toLocaleTimeString()}</span>
+                                <p className="text-[9px] text-slate-400 font-mono flex items-center gap-1.5 font-sans">
+                                  <span>{new Date(hist.timestamp).toLocaleDateString()} {new Date(hist.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
                                   {hist.isBookmarked && (
-                                    <span className="bg-amber-50 text-amber-600 text-[8px] font-bold px-1 py-0.2 rounded border border-amber-100 uppercase tracking-wide">
+                                    <span className="bg-amber-50 text-amber-600 text-[8px] font-bold px-1 py-0.2 rounded border border-amber-100 uppercase tracking-wide font-sans">
                                       Saved
                                     </span>
                                   )}
                                 </p>
                               </div>
                               
-                              {/* Row action buttons */}
-                              <div className="flex items-center gap-1 shrink-0 opacity-80 group-hover:opacity-100 transition-opacity">
+                              <div className="flex items-center gap-1 shrink-0 opacity-80 group-hover:opacity-100 transition-opacity font-sans">
                                 <button
                                   type="button"
                                   onClick={(e) => {
@@ -2223,7 +2614,7 @@ export default function App() {
                                     handleSaveToCloudDirectly(updated);
                                     showSuccess("ဤမှတ်တမ်းကိုဖျက်လိုက်ပါပြီ။");
                                   }}
-                                  className="p-1 rounded-md text-slate-350 hover:text-rose-600 hover:bg-rose-50 transition-colors"
+                                  className="p-1 rounded-md text-slate-350 hover:text-rose-600 hover:bg-rose-50 transition-colors font-sans"
                                   title="ဤမှတ်တမ်းကိုဖျက်ရန်"
                                 >
                                   <Trash2 className="w-3.5 h-3.5" />
@@ -2233,9 +2624,9 @@ export default function App() {
                           ))}
                         </div>
                       ) : (
-                        <div className="text-center py-10 text-slate-400">
+                        <div className="text-center py-10 text-slate-400 font-sans">
                           <History className="w-8 h-8 mx-auto stroke-1 mb-1 text-slate-350" />
-                          <p className="text-xs text-slate-500">သမိုင်းမှတ်တမ်း မရှိသေးပါ။</p>
+                          <p className="text-xs text-slate-500 font-sans">သမိုင်းမှတ်တမ်း မရှိသေးပါ။</p>
                         </div>
                       )}
                     </motion.div>
@@ -2250,21 +2641,21 @@ export default function App() {
                       transition={{ duration: 0.15 }}
                       className="space-y-5"
                     >
-                      <div className="border-b border-slate-100 pb-2.5">
-<h3 className="text-xs font-bold uppercase tracking-wider text-slate-755 flex items-center gap-1.5">
+                      <div className="border-b border-slate-100 pb-2.5 font-sans">
+                        <h3 className="text-xs font-bold uppercase tracking-wider text-slate-755 flex items-center gap-1.5 font-sans">
                           <HelpCircle className="w-4 h-4 text-indigo-600" />
                           အသုံးပြုနည်း လမ်းညွှန်များ
                         </h3>
                       </div>
 
-                      <div className="space-y-4 bg-slate-50 border border-slate-150 p-4 rounded-xl text-slate-705 text-xs inline-block w-full">
-                        <div className="space-y-2.5">
-                          <p className="font-semibold text-slate-800 leading-relaxed">
+                      <div className="space-y-4 bg-slate-50 border border-slate-150 p-4 rounded-xl text-slate-705 text-xs inline-block w-full font-sans">
+                        <div className="space-y-2.5 font-sans">
+                          <p className="font-semibold text-slate-800 leading-relaxed font-sans">
                             ၁။ မိမိကိုယ်ပိုင် Gemini API key ကို အောက်ပါကွက်လပ်၌ ဖြည့်ပါ။ မရှိပါက vpn ဖွင့်၍ အောက်ပါအတိုင်း Key ကို သွားယူပါ။
                           </p>
                           
-                          <div className="pl-4 space-y-1.5 text-[11px] text-slate-650">
-                            <p className="flex items-center gap-1.5">
+                          <div className="pl-4 space-y-1.5 text-[11px] text-slate-655 font-sans">
+                            <p className="flex items-center gap-1.5 font-sans">
                               <span>၂။</span>
                               <a
                                 href="https://aistudio.google.com/"
@@ -2284,7 +2675,7 @@ export default function App() {
                         </div>
                       </div>
 
-                      <div className="space-y-2">
+                      <div className="space-y-2 font-sans">
                         <div className="flex justify-between items-center">
                           <label className="block text-[10px] font-bold text-slate-700 uppercase tracking-wide">
                             မိမိကိုယ်ပိုင် Gemini API Key ဖြည့်သွင်းရန်
@@ -2320,14 +2711,14 @@ export default function App() {
                         </div>
                       </div>
 
-                      <div className="pt-1">
+                      <div className="pt-1 font-sans">
                         {customApiKey.trim() ? (
                           <div className="flex items-center gap-1.5 bg-emerald-50 text-emerald-700 border border-emerald-100 p-2.5 rounded-lg text-[10px] font-medium">
                             <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" />
                             <span>အသုံးပြုနေသောစနစ်: <b>ကိုယ်ပိုင် API Key (Custom User Key)</b> ကို အသုံးပြုထားပါသည်။</span>
                           </div>
                         ) : (
-                          <div className="flex items-center gap-1.5 bg-rose-50 text-rose-700 border border-rose-100 p-2.5 rounded-lg text-[10px] font-medium">
+                          <div className="flex items-center gap-1.5 bg-rose-50 text-rose-700 border border-rose-100 p-2.5 rounded-lg text-[10px] font-medium font-sans">
                             <div className="w-1.5 h-1.5 rounded-full bg-rose-500 shrink-0 animate-pulse" />
                             <span>အသုံးပြုနေသောစနစ်: <b>ကိုယ်ပိုင် Gemini API Key ထည့်သွင်းပေးရန် လိုအပ်ပါသည်</b></span>
                           </div>
@@ -2356,11 +2747,15 @@ export default function App() {
                           </h4>
                         </div>
 
-                        <p className="text-[10.5px] text-slate-600 leading-relaxed md:text-[11px]">
+                        <p className="text-[10.5px] text-slate-600 leading-relaxed md:text-[11px] font-sans">
                           {user ? (
-                            "Google အကောင့်ဖြင့် လုံခြုံစိတ်ချစွာ ချိတ်ဆက်ထားပါသည်။ သင်၏ ဘာသာပြန်မှတ်တမ်းများနှင့် စာမှတ်များအားလုံးကို Firestore Durable Database ပေါ်သို့ အမြဲတမ်း သိမ်းဆည်းပေးနေပါပြီ။"
+                            googleDriveToken ? (
+                              "Google Drive Sync မုဒ် (၁၀၀% Free & Unlimited) ကို အသုံးပြုနေပါသည်။ သင်၏ စာမှတ်များနှင့် ဘာသာပြန်မှတ်တမ်းများကို သင့်ကိုယ်ပိုင် Google Drive ပေါ်ရှိ 'dictionary_sync_backup.json' ဖိုင်တွင် သီးသန့် အလိုအလျောက် သိမ်းဆည်းပေးနေပါပြီ။"
+                            ) : (
+                              "Google အကောင့်ဖြင့် ချိတ်ဆက်ထားသော်လည်း Google Drive Sync လုပ်နိုင်ရန် ခွင့်ပြုချက် (Authorize) ပြန်လုပ်ပေးရန် လိုအပ်ပါသည်။ အောက်ပါ 'Google Drive နှင့် ချိတ်ဆက်မည်' ခလုတ်ကို နှိပ်ပေးပါ။"
+                            )
                           ) : !customApiKey.trim() ? (
-                            "ဒေတာများကို ဖုန်းနှင့် ကွန်ပျူတာ အချင်းချင်း စင့်ခ်လုပ်ရန်အတွက် အောက်ပါအတိုင်း Google အကောင့်ဖြင့် Sign In ဝင်ပြီး သိမ်းဆည်းနိုင်ပါသည် (သို့မဟုတ်) အပေါ်ရှိ မိမိကိုယ်ပိုင် Gemini API Key ကို ဖြည့်သွင်း၍လည်း စင့်ခ်လုပ်နိုင်ပါသည်။"
+                            "ဒေတာများကို ဖုန်းနှင့် ကွန်ပျူတာ အချင်းချင်း စင့်ခ်လုပ်ရန်အတွက် အောက်ပါအတိုင်း Google အကောင့်ဖြင့် Sign In ဝင်ပြီး ၁၀၀% အခမဲ့ဖြစ်သော Google Drive ပေါ်၌ လုံခြုံစိတ်ချစွာ သိမ်းဆည်းနိုင်ပါသည် (သို့မဟုတ်) အပေါ်ရှိ မိမိကိုယ်ပိုင် Gemini API Key ကို ဖြည့်သွင်း၍လည်း စင့်ခ်လုပ်နိုင်ပါသည်။"
                           ) : (
                             "ကိုယ်ပိုင် API Key အခြေပြု တိမ်တိုက်စင့်ခ်လှုပ်ရှားမှုမှာ အောင်မြင်စွာ အလုပ်လုပ်နေပါသည်။ သင်၏ ဘာသာပြန်ရလဒ်များ၊ စာမှတ် (Bookmarks) သမိုင်းများကို ဆာဗာသို့ အလိုအလျောက် လုံခြုံစွာ သိမ်းဆည်းလင့်ခ်ပေးနေပါပြီ။"
                           )}
@@ -2376,50 +2771,154 @@ export default function App() {
                               <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-550" /> Load လုပ်နေသည်...
                             </div>
                           ) : user ? (
-                            <div className="bg-white border border-slate-150 p-2.5 rounded-lg flex items-center justify-between shadow-xs">
-                              <div className="flex items-center gap-2">
-                                <div className="w-6.5 h-6.5 rounded-full bg-indigo-600 text-white flex items-center justify-center font-bold text-xs select-none">
-                                  {user.email ? user.email.charAt(0).toUpperCase() : "G"}
+                            <div className="space-y-2">
+                              <div className="bg-white border border-slate-150 p-2.5 rounded-lg flex items-center justify-between shadow-xs">
+                                <div className="flex items-center gap-2">
+                                  <div className="w-6.5 h-6.5 rounded-full bg-indigo-600 text-white flex items-center justify-center font-bold text-xs select-none">
+                                    {user.email ? user.email.charAt(0).toUpperCase() : "G"}
+                                  </div>
+                                  <div className="space-y-0.5">
+                                    <p className="text-[11px] font-semibold text-slate-800 leading-tight">{user.displayName || "Google User"}</p>
+                                    <p className="text-[9.5px] text-slate-400 font-mono leading-tight">{user.email}</p>
+                                  </div>
                                 </div>
-                                <div className="space-y-0.5">
-                                  <p className="text-[11px] font-semibold text-slate-800 leading-tight">{user.displayName || "Google User"}</p>
-                                  <p className="text-[9.5px] text-slate-400 font-mono leading-tight">{user.email}</p>
-                                </div>
+                                <button
+                                  type="button"
+                                  onClick={async () => {
+                                    try {
+                                      await signOut(auth);
+                                      updateGoogleDriveToken(null);
+                                      showSuccess("Google Account မှ ထွက်လိုက်ပါပြီ။");
+                                    } catch (err: any) {
+                                      console.error(err);
+                                    }
+                                  }}
+                                  className="text-[10px] font-bold text-rose-600 hover:text-rose-700 bg-rose-50 hover:bg-rose-100/60 px-2.5 py-1 rounded-md transition-all cursor-pointer"
+                                >
+                                  Sign Out
+                                </button>
                               </div>
-                              <button
-                                type="button"
-                                onClick={async () => {
-                                  try {
-                                    await signOut(auth);
-                                    showSuccess("Google Account မှ ထွက်လိုက်ပါပြီ။");
-                                  } catch (err: any) {
-                                    console.error(err);
-                                  }
-                                }}
-                                className="text-[10px] font-bold text-rose-600 hover:text-rose-700 bg-rose-50 hover:bg-rose-100/60 px-2.5 py-1 rounded-md transition-all cursor-pointer"
-                              >
-                                Sign Out
-                              </button>
+
+                              {!googleDriveToken && (
+                                <button
+                                  type="button"
+                                  onClick={async () => {
+                                    try {
+                                      const res = await signInWithPopup(auth, googleProvider);
+                                      const credential = GoogleAuthProvider.credentialFromResult(res);
+                                      if (credential?.accessToken) {
+                                        updateGoogleDriveToken(credential.accessToken);
+                                        showSuccess("Google Drive ချိတ်ဆက်မှု အောင်မြင်ပါသည်။");
+                                      } else {
+                                        throw new Error("Failed to get token.");
+                                      }
+                                    } catch (err: any) {
+                                      console.error(err);
+                                      alert("Google Drive သို့ ချိတ်ဆက်ခွင့်ပြုရန် ပျက်ကွက်ခဲ့ပါသည်။");
+                                    }
+                                  }}
+                                  className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 hover:scale-[1.01] text-white font-bold py-2.5 px-3 rounded-lg text-[11px] shadow-xs cursor-pointer active:scale-[0.98] transition-all"
+                                >
+                                  <CloudLightning className="w-4 h-4" />
+                                  Google Drive ခွင့်ပြုချက် ပေးမည် (Authorize Google Drive)
+                                </button>
+                              )}
+
+                              {googleDriveToken && (
+                                <div className="space-y-2 pt-2.5 border-t border-dashed border-indigo-100">
+                                  <button
+                                    type="button"
+                                    onClick={async () => {
+                                      try {
+                                        setIsSyncing(true);
+                                        const q = "name = 'dictionary_sync_backup.json' and trashed = false";
+                                        const searchUrl = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=${encodeURIComponent("files(id, name)")}`;
+                                        const searchRes = await resilientFetch(searchUrl, {
+                                          headers: { "Authorization": `Bearer ${googleDriveToken}` }
+                                        });
+                                        if (!searchRes.ok) {
+                                          if (searchRes.status === 401) {
+                                            updateGoogleDriveToken(null);
+                                            throw new Error("Google Drive application session expired. Please re-authorize.");
+                                          }
+                                          throw new Error("Google Drive search failed");
+                                        }
+                                        const searchData = await searchRes.json();
+                                        const files = searchData.files || [];
+                                        if (files.length === 0) {
+                                          alert("Google Drive ပေါ်တွင် Backup ဖိုင် မတွေ့သေးပါ။ စာလုံးတစ်လုံးအား Bookmark (သို့) Translate အရင်ပြုလုပ်ပေးပါ။ ဖိုင်သည် အလိုအလျောက် ရောက်ရှိသွားမည် ဖြစ်ပါသည်။");
+                                          return;
+                                        }
+                                        const fileId = files[0].id;
+                                        const getContentUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
+                                        const contentRes = await resilientFetch(getContentUrl, {
+                                          headers: { "Authorization": `Bearer ${googleDriveToken}` }
+                                        });
+                                        if (!contentRes.ok) throw new Error("Download failed");
+                                        const text = await contentRes.text();
+                                        if (text && text.trim()) {
+                                          const remoteData = JSON.parse(text);
+                                          const remoteHistory = remoteData.history || [];
+                                          if (remoteHistory.length === 0) {
+                                            alert("Backup ဖိုင်တွင် သိမ်းဆည်းထားသော အချက်အလက်မရှိသေးပါ။");
+                                            return;
+                                          }
+                                          // Force restore: Mark all items as active (isDeleted: false) and set fresh high timestamp so they win the conflict-free lww merge
+                                          const restored = remoteHistory.map((item: any) => ({
+                                            ...item,
+                                            isDeleted: false,
+                                            timestamp: Date.now()
+                                          }));
+                                          
+                                          const merged = mergeHistory(history, restored);
+                                          setHistory(merged);
+                                          await saveHistoryToIndexedDB(merged);
+                                          showSuccess(`Google Drive Backup မှ သမိုင်းနှင့် စာမှတ်မူရင်းဒေတာ ${restored.length} ခုကို အောင်မြင်စွာ ပြန်လည် ဆွဲယူရယူပြီးပါပြီ။`);
+                                          
+                                          // Push restored/resurrected state back to Google Drive right away
+                                          await handleSaveToCloudDirectly(merged);
+                                        } else {
+                                          alert("Google Drive Backup ဖိုင်မှာ ဗလာဖြစ်နေပါသည်။");
+                                        }
+                                      } catch (err: any) {
+                                        console.error(err);
+                                        alert("Backup ဒေတာ ပြန်ဆွဲရန် ကြိုးစားမှု မအောင်မြင်ပါ။ အင်တာနက် ကွန်နက်ရှင် ပြန်စစ်ဆေးပေးပါ။");
+                                      } finally {
+                                        setIsSyncing(false);
+                                      }
+                                    }}
+                                    disabled={isSyncing}
+                                    className="w-full flex items-center justify-center gap-1.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 hover:scale-[1.01] text-white font-bold py-2 px-3 rounded-lg text-[10px] shadow-xs cursor-pointer active:scale-[0.98] transition-all disabled:opacity-50"
+                                  >
+                                    <DownloadCloud className="w-3.5 h-3.5" />
+                                    Drive Backup မှ ရှာဖွေမှုမှတ်တမ်းအားလုံး ပြန်ယူရန် (Restore from Backup)
+                                  </button>
+                                </div>
+                              )}
                             </div>
                           ) : (
                             <div className="space-y-2 py-1">
-                              <p className="text-[10.5px] text-slate-550 leading-relaxed font-normal">
-                                Google အကောင့်ဖြင့် Login တစ်ကြိမ်လုပ်ထားရုံဖြင့် မည်သည့် browser, computer သို့ပြောင်းသည်ဖြစ်စေ သင့်၏ စာမှတ်များနှင့် ဝေါဟာရစုများအားလုံး မပျောက်ပျက်တော့ဘဲ အလိုအလျောက် အမြဲသိမ်းဆည်းပေးနေမည် ဖြစ်ပါသည်။
+                              <p className="text-[10.5px] text-slate-555 leading-relaxed font-normal">
+                                Google အကောင့်ဖြင့် Sign In တစ်ကြိမ်ဝင်ကာ 'drive.file' စင့်ခ်အား ခွင့်ပြုလိုက်ပါက သင့်ကိုယ်ပိုင် Google Drive ပေါ်၌ ၁၀၀% လုံခြုံစိတ်ချစွာ အခမဲ့ သိမ်းဆည်းပေးသွားမည် ဖြစ်ပါသည်။
                               </p>
                               <button
                                 type="button"
                                 onClick={async () => {
-                                  try {
-                                    const res = await signInWithPopup(auth, googleProvider);
-                                    if (res.user) {
-                                      showSuccess(`မင်္ဂလာပါ ${res.user.displayName || "လူကြီးမင်း"}။ Google ဖြင့် အောင်မြင်စွာ ချိတ်ဆက်ပြီးပါပြီ။`);
+                                    try {
+                                      const res = await signInWithPopup(auth, googleProvider);
+                                      if (res.user) {
+                                        const credential = GoogleAuthProvider.credentialFromResult(res);
+                                        if (credential?.accessToken) {
+                                          updateGoogleDriveToken(credential.accessToken);
+                                        }
+                                        showSuccess(`မင်္ဂလာပါ ${res.user.displayName || "လူကြီးမင်း"}။ Google နှင့် Google Drive ချိတ်ဆက်မှု အောင်မြင်စွာ ပြုလုပ်ပြီးပါပြီ။`);
+                                      }
+                                    } catch (err: any) {
+                                      console.error(err);
+                                      if (err.code !== "auth/popup-closed-by-user") {
+                                        alert("Login ဝင်ရောက်ရန် မအောင်မြင်ပါ။ ဘရောက်ဆာ popup ပိတ်ထားခြင်း ရှိမရှိ စစ်ဆေးပေးပါ။");
+                                      }
                                     }
-                                  } catch (err: any) {
-                                    console.error(err);
-                                    if (err.code !== "auth/popup-closed-by-user") {
-                                      alert("Login ဝင်ရောက်ရန် မအောင်မြင်ပါ။ ဘရောက်ဆာ popup ပိတ်ထားခြင်း ရှိမရှိ စစ်ဆေးပေးပါ။");
-                                    }
-                                  }
                                 }}
                                 className="w-full flex items-center justify-center gap-2 border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-bold py-2.5 px-3 rounded-lg text-[11px] shadow-xs cursor-pointer active:scale-[0.98] transition-all"
                               >
@@ -2436,7 +2935,7 @@ export default function App() {
                         </div>
 
                         {(customApiKey.trim() || user) && (
-                          <div className="space-y-2.5 border-t border-slate-100 pt-3">
+                          <div className="space-y-2.5 border-t border-slate-100 pt-3 text-sans">
                             <div className="flex items-center justify-between text-[11px] text-slate-550">
                               <span className="flex items-center gap-1.5 font-medium">
                                 <RefreshCw className={`w-3.5 h-3.5 text-indigo-600 ${isSyncing ? "animate-spin" : ""}`} />
@@ -2445,13 +2944,14 @@ export default function App() {
                               <span className="font-semibold text-indigo-700">
                                 {syncStatus === "syncing" && "စင့်ခ်လုပ်နေပါသည်..."}
                                 {syncStatus === "synced" && "Cloud ပေါ်ရှိ ဒေတာများနှင့် တိုက်ဆိုင်ပြီးစီးပါပြီ"}
+                                {syncStatus === "unauthorized" && "Google Drive သို့ ခွင့်ပြုချက် (Authorize) လိုအပ်ပါသည်။"}
                                 {syncStatus === "error" && "ဒေတာချိတ်ဆက်ရန် အခက်အခဲရှိနေပါသည်"}
                                 {syncStatus === "not_configured" && "မစတင်ရသေးပါ"}
                               </span>
                             </div>
 
                             {lastSyncedTime && (
-                              <div className="flex items-center justify-between text-[11px] text-slate-550">
+                              <div className="flex items-center justify-between text-[11px] text-slate-555 font-sans">
                                 <span className="font-medium">နောက်ဆုံးစင့်ခ်လုပ်ချိန်:</span>
                                 <span className="font-mono font-semibold text-slate-700">{lastSyncedTime}</span>
                               </div>
@@ -2461,17 +2961,59 @@ export default function App() {
                               type="button"
                               disabled={isSyncing}
                               onClick={() => handleSyncWithCloud()}
-                              className="w-full text-xs font-bold bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white py-2 px-4 rounded-lg shadow-xs transition-all cursor-pointer flex items-center justify-center gap-1.5 active:scale-[0.99]"
+                              className="w-full text-xs font-bold bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white py-2 px-4 rounded-lg shadow-xs transition-all cursor-pointer flex items-center justify-center gap-1.5 active:scale-[0.99] font-sans text-center"
                             >
                               <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? "animate-spin" : ""}`} />
-                              {isSyncing ? "မိုဘိုင်း/ကွန်ပျူတာ ဒေတာများ ဆွဲယူနေပါသည်..." : "ဒေတာကို ဆာဗာနှင့် ချက်ချင်း စင့်ခ်လုပ်ရန် (Pull & Sync Now)"}
+                              {isSyncing ? "ဒေတာများ ဆွဲယူနေပါသည်..." : "ဒေတာကို ချက်ချင်း စင့်ခ်လုပ်ရန် (Pull & Sync Now)"}
                             </button>
                           </div>
                         )}
                       </div>
+
+                      {/* Local File Backup & Restore (User Request) */}
+                      <div className="bg-slate-50 border border-slate-200/90 p-4 rounded-xl space-y-3 shadow-3xs mt-4">
+                        <div className="flex items-center justify-between animate-fade-in font-sans">
+                          <h4 className="text-xs font-bold text-slate-800 flex items-center gap-1.5 uppercase tracking-wide">
+                            <FileText className="w-4 h-4 text-emerald-600" />
+                            ဒေတာများ ဖိုင်အဖြစ် ထုတ်ယူခြင်းနှင့် ပြန်သွင်းခြင်း (Local Backup & Restore)
+                          </h4>
+                        </div>
+
+                        <p className="text-[10.5px] text-slate-555 leading-relaxed font-sans">
+                          သင့်ရဲ့ စာမှတ်များ (Bookmarks) နှင့် ရှာဖွေမှုမှတ်တမ်း (History) များ စက်ထဲမှ အကြောင်းအမျိုးမျိုးကြောင့် ပျောက်ပျက်သွားပါက ပြန်လည်အသုံးပြုနိုင်ရန် ဖုန်း သို့မဟုတ် ကွန်ပျူတာ၏ File Manager ထဲသို့ <b>ဒေတာ backup ဖိုင် (.json)</b> ထုတ်ယူသိမ်းဆည်းထားနိုင်ပြီး လိုအပ်လျှင် ပြန်တင်သွင်းယူနိုင်ပါသည်။
+                        </p>
+
+                        <div className="grid grid-cols-2 gap-2 mt-2 pt-1 font-sans">
+                          <button
+                            type="button"
+                            onClick={handleExportDataFile}
+                            className="flex items-center justify-center gap-1.5 text-[11px] font-bold bg-white text-indigo-700 border border-slate-200 py-2.5 px-3 rounded-lg shadow-3xs hover:bg-slate-50/50 cursor-pointer active:scale-95 transition-all text-center font-sans"
+                            title="စာမှတ်နှင့် မှတ်တမ်းများကို ဖိုင်အဖြစ် ဒေါင်းလုဒ်ဆွဲပါမည်"
+                          >
+                            <Download className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+                            <span>Backup ဖိုင် သိမ်းရန် (Export)</span>
+                          </button>
+
+                          <input
+                            type="file"
+                            ref={backupInputRef}
+                            accept=".json"
+                            onChange={handleImportDataFile}
+                            className="hidden font-sans"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => backupInputRef.current?.click()}
+                            className="flex items-center justify-center gap-1.5 text-[11px] font-bold bg-emerald-600 hover:bg-emerald-700 text-white py-2.5 px-3 rounded-lg shadow-3xs cursor-pointer active:scale-95 transition-all text-center font-sans"
+                            title="သိမ်းဆည်းထားသော ဖိုင်မှ စာမှတ်များနှင့် မှတ်တမ်းများကို ပြန်လည် ဖတ်သွင်းပါမည်"
+                          >
+                            <Upload className="w-3.5 h-3.5 text-white shrink-0" />
+                            <span>Backup ပြန်သွင်းရန် (Import)</span>
+                          </button>
+                        </div>
+                      </div>
                     </motion.div>
-                  )}
-                </AnimatePresence>
+                  )}</AnimatePresence>
               </div>
             </div>
           </section>
