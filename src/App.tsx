@@ -262,6 +262,29 @@ async function resilientFetch(input: RequestInfo | URL, init?: RequestInit, retr
   throw lastError || new Error(`Failed to fetch ${input} after ${retries} attempts.`);
 }
 
+const FORBIDDEN_WORDS_SET = new Set([
+  "a", "an", "the",
+  "i", "me", "my", "mine", "myself", "we", "us", "our", "ours", "ourselves", 
+  "you", "your", "yours", "yourself", "yourselves", "he", "him", "his", "himself", 
+  "she", "her", "hers", "herself", "it", "its", "itself", "they", "them", "their", 
+  "theirs", "themselves", "this", "that", "these", "those", "who", "whom", "whose", 
+  "which", "what", "any", "some", "someone", "somebody", "something", "anybody", 
+  "anyone", "anything", "nobody", "noone", "nothing", "everyone", "everybody", "everything",
+  "of", "to", "in", "for", "on", "with", "at", "by", "from", "up", "about", "into", "over", 
+  "after", "during", "through", "before", "between", "under", "along", "behind", "down", "off", 
+  "out", "since", "until", "upon", "within", "without", "above", "across", "against", "alongside", 
+  "among", "around", "below", "beneath", "beside", "besides", "beyond", "except", "inside", 
+  "near", "outside", "past", "throughout", "toward", "towards", "underneath",
+  "am", "is", "are", "was", "were", "be", "been", "being", 
+  "have", "has", "had", "having", "do", "does", "did", "doing", "done",
+  "will", "would", "shall", "should", "can", "could", "may", "might", "must", "ought",
+  "to"
+]);
+
+const FORBIDDEN_POS_SET = new Set([
+  "PRON", "PRONOUN", "PREP", "PREPOSITION", "DET", "ARTICLE", "AUX", "AUXILIARY", "MODAL", "CONJ", "CONJUNCTION", "PART", "PARTICLE"
+]);
+
 export default function App() {
   // Inputs
   const [inputText, setInputText] = useState("");
@@ -271,6 +294,7 @@ export default function App() {
   const isSyncingRef = useRef(false);
   const isTranslatingRef = useRef(false);
   const isSyncingStateRef = useRef(false);
+  const isWipingRef = useRef(false);
   const pendingSyncHistoryRef = useRef<HistoryItem[] | null>(null);
   const [dictionaryMap, setDictionaryMap] = useState<Map<string, string>>(new Map());
   const [dictionarySource, setDictionarySource] = useState<"sample" | "user_file">("sample");
@@ -299,19 +323,73 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResult, setSearchResult] = useState<string | null>(null);
 
+  // Splits text into a basic list of words as fallback if a translation doesn't have the segmented words array (e.g. older backups)
+  const getWordsFromText = (text: string): { original: string; base: string; pos: string; fallback_my: string }[] => {
+    if (!text) return [];
+
+    // Split by letters, numbers, apostrophes, and hyphens to preserve words like don't or state-of-the-art
+    const rawWords = text.match(/[A-Za-z0-9'-]+/g) || [];
+    const seen = new Set<string>();
+    const result: { original: string; base: string; pos: string; fallback_my: string }[] = [];
+
+    for (const word of rawWords) {
+      const cleaned = word.trim()
+        .replace(/^[.,\/#!$%\^&\*;:{}=\_`~()?"'’‘“”•*]+|[.,\/#!$%\^&\*;:{}=\_`~()?"'’‘“”•*]+$/g, "")
+        .trim();
+      
+      if (!cleaned) continue;
+      
+      const lowerCleaned = cleaned.toLowerCase();
+      if (FORBIDDEN_WORDS_SET.has(lowerCleaned)) {
+        continue;
+      }
+
+      if (!seen.has(lowerCleaned)) {
+        seen.add(lowerCleaned);
+        result.push({
+          original: cleaned,
+          base: lowerCleaned,
+          pos: "",
+          fallback_my: "",
+        });
+      }
+    }
+    return result;
+  };
+
   // Strips the huge dictionary_definition string from persistent storage to keep payload sizes tiny and avoid localStorage quota limit errors (5MB)
   // Also permanently purges deleted items so that "Clear" / "Delete" actions are final and never backed up/restored to/from Google Drive.
   const sanitizeHistoryItems = (items: HistoryItem[]): HistoryItem[] => {
     if (!Array.isArray(items)) return [];
     return items
-      .filter((item) => item && !item.isDeleted)
-      .map((item) => ({
-        ...item,
-        words: item.words ? item.words.map((w: any) => {
-          const { dictionary_definition, ...rest } = w;
-          return rest;
-        }) : [],
-      }));
+      .map((item) => {
+        if (!item) return null;
+        if (item.isDeleted) {
+          return {
+            id: item.id,
+            originalText: item.originalText,
+            translation: item.translation,
+            isBookmarked: item.isBookmarked ?? false,
+            isDeleted: true,
+            timestamp: item.timestamp,
+            words: []
+          };
+        }
+
+        // Reconstruct words list if it's missing or empty so that dynamic definitions can be looked up on click
+        const finalWords = (item.words && item.words.length > 0)
+          ? item.words
+          : getWordsFromText(item.originalText);
+
+        return {
+          ...item,
+          words: finalWords.map((w: any) => {
+            const { dictionary_definition, ...rest } = w;
+            return rest;
+          }),
+        };
+      })
+      .filter((item): item is HistoryItem => item !== null);
   };
 
   // History / Logs with local persistence
@@ -396,6 +474,7 @@ export default function App() {
 
   const [isUploadingToServer, setIsUploadingToServer] = useState(false);
   const [isDeletingFromServer, setIsDeletingFromServer] = useState<string | null>(null);
+  const [isWiping, setIsWiping] = useState(false);
   
   // Parser debug info
   const [parserDebugInfo, setParserDebugInfo] = useState<{
@@ -455,7 +534,11 @@ export default function App() {
     return null;
   });
 
-  const updateGoogleDriveToken = (token: string | null) => {
+  const [googleDriveAuthorized, setGoogleDriveAuthorized] = useState<boolean>(() => {
+    return safeLocalStorage.getItem("google_drive_authorized") === "true";
+  });
+
+  const updateGoogleDriveToken = (token: string | null, clearAuthCompletely = false) => {
     setGoogleDriveToken(token);
     if (token) {
       const tokenData = {
@@ -463,8 +546,14 @@ export default function App() {
         expiresAt: Date.now() + 365 * 24 * 3600 * 1000 // Persistent fallback
       };
       safeLocalStorage.setItem("google_drive_token_info", JSON.stringify(tokenData));
+      safeLocalStorage.setItem("google_drive_authorized", "true");
+      setGoogleDriveAuthorized(true);
     } else {
       safeLocalStorage.removeItem("google_drive_token_info");
+      if (clearAuthCompletely) {
+        safeLocalStorage.removeItem("google_drive_authorized");
+        setGoogleDriveAuthorized(false);
+      }
     }
   };
 
@@ -480,7 +569,6 @@ export default function App() {
         // Logged out: restore cloud sync key to the custom API key if present
         const currentApiKey = safeLocalStorage.getItem("gemini_api_key") || "";
         setCloudSyncKey(currentApiKey);
-        updateGoogleDriveToken(null);
       }
     });
     return () => unsubscribe();
@@ -690,12 +778,12 @@ export default function App() {
 
   // Fetches cloud data and merges it with local storage on startup or key setup
   const handleSyncWithCloud = async (overrideHistory?: HistoryItem[]) => {
-    if (user) {
-      if (!googleDriveToken) {
-        setSyncStatus("unauthorized");
-        return;
-      }
-    } else if (!cloudSyncKey || !cloudSyncKey.trim()) {
+    if (isWipingRef.current) {
+      console.log("[Sync] Bypassing cloud sync because system is performing a full wipe & clean reset.");
+      return;
+    }
+
+    if (!cloudSyncKey || !cloudSyncKey.trim()) {
       setSyncStatus("not_configured");
       return;
     }
@@ -720,12 +808,20 @@ export default function App() {
       let merged: HistoryItem[] = [];
       const currentLocal = overrideHistory || latestHistoryRef.current;
 
+      let hasSyncedGdrive = false;
       if (user && googleDriveToken) {
         console.log("[Sync] Syncing through Google Drive...");
-        const gdResult = await handleGoogleDriveSync(googleDriveToken, currentLocal);
-        merged = gdResult.merged;
-        remoteHistory = gdResult.remoteHistory;
-      } else {
+        try {
+          const gdResult = await handleGoogleDriveSync(googleDriveToken, currentLocal);
+          merged = gdResult.merged;
+          remoteHistory = gdResult.remoteHistory;
+          hasSyncedGdrive = true;
+        } catch (gdError: any) {
+          console.warn("[Sync] Google Drive sync failed or expired, falling back to server database sync:", gdError);
+        }
+      }
+
+      if (!hasSyncedGdrive) {
         console.log("[Sync] Syncing through secure unified server API route...");
         const lagRes = await resilientFetch("/api/sync/get", {
           method: "POST",
@@ -791,6 +887,10 @@ export default function App() {
 
   // Automatically sync local changes to cloud safely
   useEffect(() => {
+    if (isWipingRef.current) {
+      return;
+    }
+
     if (!googleDriveToken && (!cloudSyncKey || !cloudSyncKey.trim())) {
       setSyncStatus("not_configured");
       return;
@@ -1299,7 +1399,9 @@ export default function App() {
       linkElement.setAttribute('download', exportFileDefaultName);
       linkElement.click();
       
-      showSuccess("စာမှတ်နှင့် ဘာသာပြန်မှတ်တမ်းဒေတာများကို Backup ဖိုင် (.json) အဖြစ် အောင်မြင်စွာ ထုတ်ယူသိမ်းဆည်းပြီးပါပြီ။");
+      const numBookmarks = history.filter(item => item.isBookmarked && !item.isDeleted).length;
+      const numHistory = history.filter(item => !item.isBookmarked && !item.isDeleted).length;
+      showSuccess(`စာမှတ် (Bookmark) ${numBookmarks} ခုနှင့် သမိုင်းရှာဖွေမှုမှတ်တမ်း (History) ${numHistory} ခုကို Backup ဖိုင် (.json) အဖြစ် အောင်မြင်စွာ ထုတ်ယူသိမ်းဆည်းပြီးပါပြီ။`);
     } catch (err: any) {
       showError("Backup ထုတ်ယူရန် မအောင်မြင်ပါ: " + err.message);
     }
@@ -1397,7 +1499,9 @@ export default function App() {
         handleSaveToCloudDirectly(sanitizedMerged);
 
         // Detailed success report indicating what was actually imported/restored
-        let feedbackMessage = `Backup ဖိုင်ထဲမှ ဒေတာ ${totalProcessed} ခုကို တင်သွင်းပြီးပါပြီ။ `;
+        const parsedBookmarks = parsed.filter(item => item.isBookmarked && !item.isDeleted).length;
+        const parsedHistory = parsed.filter(item => !item.isBookmarked && !item.isDeleted).length;
+        let feedbackMessage = `Backup ဖိုင်ထဲမှ စာမှတ် (Bookmark) ${parsedBookmarks} ခုနှင့် သမိုင်းရှာဖွေမှုမှတ်တမ်း (History) ${parsedHistory} ခုကို တင်သွင်းပြီးပါပြီ။ `;
         
         const details: string[] = [];
         if (newItemsAdded > 0) {
@@ -1423,6 +1527,96 @@ export default function App() {
     };
     reader.readAsText(file);
     e.target.value = "";
+  };
+
+  // Completely wipe all data: local memory, localStorage, IndexedDB, Google Drive backup file, and Server cloud sync db
+  const handleWipeAllDataAndCloud = async () => {
+    const confirmWipe = window.confirm(
+      "🚨 သတိပေးချက်။ သင်၏ စာမှတ်များနှင့် ရှာဖွေမှုမှတ်တမ်းအားလုံးကို ဤစက်နှင့်အတူ Google Drive Backup ဖိုင်၊ ဆာဗာဒေတာဘေ့စ်တို့မှပါ လုံးဝအပြီးအပိုင် (လုံးဝအပြောင်) ရှင်းလင်းဖျက်ဆီးပစ်ပါမည်။ ဤလုပ်ငန်းစဉ်ကို ရှင်းလင်းပြီးနောက် ပြန်လည်ရယူ၍ မရနိုင်ပါ။ ဆက်လက်လုပ်ဆောင်လိုပါသလား?"
+    );
+    if (!confirmWipe) return;
+
+    try {
+      setIsWiping(true);
+      isWipingRef.current = true;
+
+      // 1. Clear local memory state
+      setHistory([]);
+
+      // 2. Clear LocalStorage
+      safeLocalStorage.removeItem("em_translator_history");
+
+      // 3. Clear IndexedDB history fallback cache
+      await saveHistoryToIndexedDB([]);
+
+      let feedback = "သင်၏ လက်ရှိ စာမှတ်နှင့် ရှာဖွေမှုမှတ်တမ်းအားလုံးကို လုံးဝရှင်းလင်းပြီးပါပြီ။";
+
+      // 4. Overwrite Google Drive backup file if authorized
+      if (googleDriveToken) {
+        console.log("[Wipe] Overwriting Google Drive sync backup...");
+        try {
+          const q = "name = 'dictionary_sync_backup.json' and trashed = false";
+          const searchUrl = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=${encodeURIComponent("files(id, name)")}`;
+          const searchRes = await resilientFetch(searchUrl, {
+            headers: { "Authorization": `Bearer ${googleDriveToken}` }
+          });
+          if (searchRes.ok) {
+            const searchData = await searchRes.json();
+            const files = searchData.files || [];
+            if (files.length > 0) {
+              const fileId = files[0].id;
+              const updateUrl = `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`;
+              const saveRes = await resilientFetch(updateUrl, {
+                method: "PATCH",
+                headers: {
+                  "Authorization": `Bearer ${googleDriveToken}`,
+                  "Content-Type": "application/json"
+                },
+                body: JSON.stringify({ history: [] })
+              });
+              if (saveRes.ok) {
+                feedback += " Google Drive Backup ဖိုင်ကိုလည်း အပြောင်ရှင်းလင်းပြီးပါပြီ။";
+              }
+            }
+          }
+        } catch (gdErr: any) {
+          console.warn("Wiping Google Drive backup file failed:", gdErr);
+        }
+      }
+
+      // 5. Overwrite server unified sync database history
+      if (cloudSyncKey && cloudSyncKey.trim()) {
+        console.log("[Wipe] Overwriting server cloud sync DB history...");
+        try {
+          const saveRes = await resilientFetch("/api/sync/save", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              apiKey: cloudSyncKey.trim(),
+              history: []
+            })
+          });
+          if (saveRes.ok) {
+            feedback += " Server Cloud Sync ဒေတာများကိုလည်း ရှင်းလင်းပြီးပါပြီ။";
+          }
+        } catch (serverErr: any) {
+          console.warn("Wiping server sync data failed:", serverErr);
+        }
+      }
+
+      showSuccess(feedback);
+    } catch (err: any) {
+      showError("ဒေတာအားလုံး ရှင်းလင်းရန် ကြိုးစားမှု မအောင်မြင်ပါ: " + err.message);
+    } finally {
+      setIsWiping(false);
+      // Wait to ensure all background debounce runs are fully bypassed/cancelled
+      setTimeout(() => {
+        isWipingRef.current = false;
+        console.log("[Wipe] System reset lock released.");
+      }, 1500);
+    }
   };
 
   // Load an uploaded local file
@@ -1639,6 +1833,22 @@ export default function App() {
     }
   };
 
+  const copyText = (text: string, isTranslation = false) => {
+    if (!text) return;
+    navigator.clipboard.writeText(text)
+      .then(() => {
+        if (isTranslation) {
+          setCopiedTranslation(true);
+          setTimeout(() => setCopiedTranslation(false), 2000);
+        }
+        showSuccess("အောင်မြင်စွာ ကူးယူပြီးပါပြီ။");
+      })
+      .catch((err) => {
+        console.error("Copy failed:", err);
+        showError("ကူးယူရန် အဆင်မပြေဖြစ်သွားပါသည်။");
+      });
+  };
+
   // Main Action: Translate Sentence and Match Dictionary
   const handleTranslateAndProcess = async () => {
     if (!inputText.trim() && !selectedImage) {
@@ -1722,12 +1932,11 @@ export default function App() {
             if (isParsingSuccess) {
               if (data && data.error) {
                 let errMsg = data.error;
-                // If it is an SDK error with embedded JSON, make it human-readable
                 if (typeof errMsg === "string") {
                   if (errMsg.includes("API key not valid") || errMsg.includes("API_KEY_INVALID")) {
-                    errMsg = "ထည့်သွင်းထားသော Gemini API Key မမှန်ကန်ပါ။ ကျေးဇူးပြု၍ 'ဆက်တင် (Settings)' တက်ဘ်တွင် သင်၏ API Key ကို ပြန်လည်စစ်ဆေးပေးပါ။ (The provided Gemini API Key is invalid.)";
+                    errMsg = "ထည့်သွင်းထားသော Gemini API Key မမှန်ကန်ပါ။ ကျေးဇူးပြု၍ 'ဆက်တင် (Settings)' တက်ဘ်တွင် သင်၏ API Key ကို ပြန်လည်စစ်ဆေးပေးပါ။";
                   } else if (errMsg.includes("quota") || errMsg.includes("QUOTA_EXCEEDED")) {
-                    errMsg = "Gemini API အသုံးပြုခွင့် Quota ကုန်ဆုံးသွားပါပြီ။ ခေတ္တစောင့်ဆိုင်းပြီးမှ ထပ်စမ်းကြည့်ပါ သို့မဟုတ် အခြား API Key တစ်ခု ပြောင်းသုံးပေးပါ။ (Quota exceeded.)";
+                    errMsg = "Gemini API အသုံးပြုခွင့် Quota ကုန်ဆုံးသွားပါပြီ။ ခေတ္တစောင့်ဆိုင်းပြီးမှ ထပ်စမ်းကြည့်ပါ သို့မဟုတ် အခြား API Key တစ်ခု ပြောင်းသုံးပေးပါ။";
                   }
                 }
                 throw new Error(errMsg);
@@ -1742,7 +1951,6 @@ export default function App() {
             }
 
             if (attempts < maxAttempts) {
-              // Wait slightly before retrying (1000ms)
               await new Promise((resolve) => setTimeout(resolve, 1000));
               continue;
             }
@@ -1758,7 +1966,6 @@ export default function App() {
           if (attempts >= maxAttempts) {
             throw fetchErr;
           }
-          // Wait slightly before retrying (1000ms)
           await new Promise((resolve) => setTimeout(resolve, 1000));
         }
       }
@@ -1772,23 +1979,38 @@ export default function App() {
         setInputText(data.extractedText);
       }
 
-      // Match words in the response with our dictionary map
-      const analyzedWordsWithLookups = data.words.map((aw: AnalyzedWord) => {
-        // Match base word first
-        const baseKey = aw.base.toLowerCase().trim().replace(/\d+$/, "");
-        let definition = dictionaryMap.get(baseKey);
-        
-        // If not found, match original word directly as fallback
-        if (!definition && aw.original) {
-          const originalKey = aw.original.toLowerCase().trim().replace(/\d+$/, "");
-          definition = dictionaryMap.get(originalKey);
-        }
+      // Match words in the response with our dictionary map, filtering out pronouns, prepositions, articles, modal/auxiliary verbs
+      const analyzedWordsWithLookups = (data.words || [])
+        .filter((aw: AnalyzedWord) => {
+          if (!aw) return false;
+          const baseKey = (aw.base || "").toLowerCase().trim();
+          const origKey = (aw.original || "").toLowerCase().trim();
+          const posKey = (aw.pos || "").toUpperCase().trim();
+          
+          if (FORBIDDEN_WORDS_SET.has(baseKey) || FORBIDDEN_WORDS_SET.has(origKey)) {
+            return false;
+          }
+          if (FORBIDDEN_POS_SET.has(posKey)) {
+            return false;
+          }
+          return true;
+        })
+        .map((aw: AnalyzedWord) => {
+          // Match base word first
+          const baseKey = aw.base.toLowerCase().trim().replace(/\d+$/, "");
+          let definition = dictionaryMap.get(baseKey);
+          
+          // If not found, match original word directly as fallback
+          if (!definition && aw.original) {
+            const originalKey = aw.original.toLowerCase().trim().replace(/\d+$/, "");
+            definition = dictionaryMap.get(originalKey);
+          }
 
-        return {
-          ...aw,
-          dictionary_definition: definition || null,
-        };
-      });
+          return {
+            ...aw,
+            dictionary_definition: definition || null,
+          };
+        });
 
       const finalResult = {
         translation: data.translation,
@@ -1800,7 +2022,6 @@ export default function App() {
       setActiveRightTab("vocab");
 
       // Add to history list with bookmark preservation and duplicate filtering
-      // We strip the huge dictionary_definition string from persistent storage to keep payload sizes tiny and avoid localStorage quota limit errors (5MB)
       const strippedWords = analyzedWordsWithLookups.map((w: any) => ({
         original: w.original,
         base: w.base,
@@ -1834,7 +2055,6 @@ export default function App() {
       if (merged.length > 50) {
         const bookmarkedList = merged.filter((item) => item.isBookmarked);
         const nonBookmarkedList = merged.filter((item) => !item.isBookmarked);
-        // Keep up to 30 recent non-bookmarked items
         merged = [...bookmarkedList, ...nonBookmarkedList.slice(0, 30)];
       }
 
@@ -1865,83 +2085,73 @@ export default function App() {
         friendlyError = "Gemini API Key မတွေ့ရှိပါ သို့မဟုတ် လွဲမှားနေပါသည်။ ကျေးဇူးပြု၍ .env သို့မဟုတ် Settings တွင် API Key ထည့်ထားမှု ပြန်လည်စစ်ဆေးပေးပါ။";
       }
       
-      showError(`ဘာသာပြန်ဆိုမှု မအောင်မြင်ပါ- ${friendlyError}`);
+      showError(`ဘာသာပြန်ဆိုမှု မအောင်မြင်ပါ။ ဘာသာပြန်စနစ်ချိတ်ဆက်ရန် ပြဿနာတစ်ခုရှိနေပါသည်။ (Error: ${friendlyError})`);
     } finally {
       setIsTranslating(false);
     }
   };
 
-  // Quick helper to fill input text with a beautiful sample sentence
-  const loadTestSentence = (text: string) => {
-    setInputText(text);
-  };
-
-  const copyText = (text: string, isTranslation = false) => {
-    navigator.clipboard.writeText(text);
-    if (isTranslation) {
-      setCopiedTranslation(true);
-      setTimeout(() => setCopiedTranslation(false), 2000);
-    }
-  };
-
-  // Language helper translations (Burmese is default, but clean bilingual captions are used)
   return (
-    <div className="min-h-screen bg-[#F8FAFC]">
-      <main className="max-w-full mx-auto px-4 md:px-8 lg:px-12 py-8">
-        
-        {/* International-Standard Premium Header Banner */}
-        <div className="mb-8 relative overflow-hidden rounded-2xl border border-slate-900/10 bg-gradient-to-r from-slate-900 via-indigo-950 to-slate-900 shadow-xl py-8 px-8 flex items-center justify-center text-center">
-          {/* Stunning subtle glowing orb effects for high productivity feel */}
-          <div className="absolute top-1/2 left-1/4 -translate-y-1/2 w-80 h-32 bg-cyan-500/10 rounded-full blur-3xl pointer-events-none animate-pulse" style={{ animationDuration: '4s' }} />
-          <div className="absolute top-1/2 right-1/4 -translate-y-1/2 w-80 h-32 bg-violet-600/15 rounded-full blur-3xl pointer-events-none animate-pulse" style={{ animationDuration: '6s' }} />
-          <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.03),transparent)] pointer-events-none" />
-          
-          <h1 className="relative text-2xl sm:text-3.5xl font-extrabold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-white via-indigo-100 to-indigo-50 drop-shadow-sm">
-            Translator and Definitions
-          </h1>
+    <div className="min-h-screen bg-slate-50 flex flex-col font-sans transition-colors">
+      {/* Premium Elegant Header Banner */}
+      <header className="bg-indigo-900 text-white shadow-md border-b border-indigo-950 py-4.5 px-4 sm:px-6 sticky top-0 z-40">
+        <div className="max-w-full mx-auto flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className="bg-white/10 p-2 rounded-xl border border-white/15 backdrop-blur-xs">
+              <Languages className="w-6 h-6 text-indigo-300" />
+            </div>
+            <div>
+              <h1 className="text-lg sm:text-xl font-extrabold tracking-tight flex items-center gap-2">
+                Myanmar Smart Translator
+                <span className="text-[10px] font-sans font-extrabold bg-indigo-500/30 text-indigo-200 border border-indigo-500/20 px-2 py-0.5 rounded-full uppercase tracking-wider">
+                  Premium
+                </span>
+              </h1>
+              <p className="text-[10.5px] text-indigo-200/90 font-medium">
+                English ➔ Myanmar Sentence Translator with Instant Dictionary Lookup
+              </p>
+            </div>
+          </div>
+
+          {/* Cloud Sync State Header Panel */}
+          <div className="flex flex-wrap items-center gap-2.5 bg-white/5 border border-white/10 px-3.5 py-1.5 rounded-xl backdrop-blur-xs">
+            <div className="flex items-center gap-2">
+              <div className={`w-2 h-2 rounded-full ${
+                syncStatus === "synced" ? "bg-emerald-400 animate-pulse" :
+                syncStatus === "syncing" ? "bg-amber-400 animate-spin" :
+                syncStatus === "error" ? "bg-rose-400" : "bg-slate-400"
+              }`} />
+              <span className="text-[11px] font-sans font-bold uppercase tracking-wider text-slate-200">
+                {syncStatus === "synced" ? "CLOUD SYNCED" :
+                 syncStatus === "syncing" ? "SYNCING..." :
+                 syncStatus === "error" ? "SYNC ERROR" : "LOCAL MODE"}
+              </span>
+            </div>
+            {lastSyncedTime && (
+              <span className="text-[10px] font-mono text-indigo-200 border-l border-white/15 pl-2">
+                Last: {lastSyncedTime}
+              </span>
+            )}
+          </div>
         </div>
+      </header>
 
-        {/* Dynamic Alerts */}
-        <AnimatePresence>
-          {successMessage && (
-            <motion.div 
-              initial={{ opacity: 0, y: -10 }} 
-              animate={{ opacity: 1, y: 0 }} 
-              exit={{ opacity: 0, y: -10 }}
-              className="mb-6 p-4 bg-emerald-50 border border-emerald-200/60 rounded-xl text-emerald-800 text-sm flex items-center gap-3"
-            >
-              <div className="w-6 h-6 rounded-md bg-emerald-500/10 flex items-center justify-center text-emerald-600 font-bold shrink-0">✓</div>
-              <p className="font-medium">{successMessage}</p>
-            </motion.div>
-          )}
-
-          {errorMessage && (
-            <motion.div 
-              initial={{ opacity: 0, y: -10 }} 
-              animate={{ opacity: 1, y: 0 }} 
-              exit={{ opacity: 0, y: -10 }}
-              className="mb-6 p-4 bg-rose-50 border border-rose-200/60 rounded-xl text-rose-800 text-sm flex items-center gap-3"
-            >
-              <AlertCircle className="w-5 h-5 text-rose-500 shrink-0" />
-              <p className="font-medium">{errorMessage}</p>
-            </motion.div>
-          )}
-        </AnimatePresence>
-
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+      {/* Main Grid Section */}
+      <main className="flex-1 max-w-full mx-auto w-full px-4 md:px-8 py-8">
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
           
-          {/* Main workspace arena: 7 columns on large desktop */}
-          <section className="lg:col-span-7 space-y-8">
-            
-            {/* Input card */}
-            <div className="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-6 relative overflow-hidden">
-              <div className="absolute top-0 left-0 right-0 h-[2px] bg-indigo-600" />
+          {/* Main Translator Pane: 7 columns on desktop */}
+          <section className="lg:col-span-7 space-y-6">
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-md p-6 relative overflow-hidden transition-all hover:shadow-lg">
+              <div className="absolute top-0 left-0 right-0 h-[3px] bg-gradient-to-r from-indigo-500 to-violet-500" />
               
               <div className="flex justify-between items-center mb-4">
-                <div className="flex items-center gap-2 text-sm font-semibold text-indigo-600">
+                <h3 className="text-xs font-bold tracking-widest text-indigo-850 uppercase flex items-center gap-1.5">
                   <Sparkles className="w-4 h-4 text-indigo-500" />
-                </div>
-                <div className="flex items-center gap-2">
+                  စာသား နှင့် ပုံရိပ် ဘာသာပြန်စနစ် (Input English / Myanmar)
+                </h3>
+
+                <div className="flex items-center gap-1.5">
                   <button
                     type="button"
                     onClick={async () => {
@@ -2040,7 +2250,6 @@ export default function App() {
                   </button>
                 </div>
               )}
-
 
               {/* Perform translator CTA */}
               <div className="mt-6 flex justify-center">
@@ -2172,7 +2381,7 @@ export default function App() {
                   }`}
                 >
                   <History className="w-3.5 h-3.5" />
-                  မှတ်တမ်း {history.filter(item => !item.isDeleted).length > 0 ? `(${history.filter(item => !item.isDeleted).length})` : ""}
+                  မှတ်တမ်း {history.filter(item => !item.isDeleted && !item.isBookmarked).length > 0 ? `(${history.filter(item => !item.isDeleted && !item.isBookmarked).length})` : ""}
                 </button>
               </div>
 
@@ -2219,7 +2428,7 @@ export default function App() {
                             >
                               {translationResult.words.map((word, idx) => (
                                 <option key={idx} value={idx}>
-                                  {idx + 1}. {word.original} ({word.pos})
+                                  {idx + 1}. {word.original}
                                 </option>
                               ))}
                             </select>
@@ -2460,16 +2669,34 @@ export default function App() {
                                     e.stopPropagation();
                                     const updated = history.map((item) =>
                                       item.id === hist.id 
-                                        ? { ...item, isBookmarked: false, timestamp: Date.now() } 
+                                        ? { ...item, isBookmarked: false, isDeleted: true, timestamp: Date.now() } 
                                         : item
                                     );
                                     handleSaveToCloudDirectly(updated);
-                                    showSuccess("စာမှတ်မှ ဖယ်ထုတ်လိုက်ပါပြီ။");
+                                    showSuccess("ဤစာမှတ်ကို အပြီးတိုင် ဖျက်ပြီးပါပြီ။");
                                   }}
                                   className="p-1 rounded-md text-slate-400 hover:text-amber-500 hover:bg-slate-50 transition-colors"
-                                  title="စာမှတ်မှဖယ်ထုတ်ရန်"
+                                  title="ဤစာမှတ်ကို အပြီးတိုင်ဖျက်ရန်"
                                 >
                                   <Star className="w-3.5 h-3.5 fill-current text-amber-500" />
+                                </button>
+
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    const updated = history.map((item) =>
+                                      item.id === hist.id 
+                                        ? { ...item, isDeleted: true, timestamp: Date.now() } 
+                                        : item
+                                    );
+                                    handleSaveToCloudDirectly(updated);
+                                    showSuccess("ဤစာမှတ်ကို အပြီးတိုင် ဖျက်လိုက်ပါပြီ။");
+                                  }}
+                                  className="p-1 rounded-md text-slate-350 hover:text-rose-600 hover:bg-rose-50 transition-colors font-sans"
+                                  title="ဤစာမှတ်ကို အပြီးတိုင်ဖျက်ရန်"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
                                 </button>
                               </div>
                             </div>
@@ -2504,7 +2731,7 @@ export default function App() {
                             ရှာဖွေခဲ့သမျှ စာရင်းဇယားမှတ်တမ်း (Bookmark များ မပျက်ပါ)
                           </p>
                         </div>
-                        {history.filter(item => !item.isDeleted).length > 0 && (
+                        {history.filter(item => !item.isDeleted && !item.isBookmarked).length > 0 && (
                           <button
                             onClick={() => {
                               const activeNonBookmarked = history.filter(item => !item.isDeleted && !item.isBookmarked);
@@ -2529,9 +2756,9 @@ export default function App() {
                         )}
                       </div>
 
-                      {history.filter(item => !item.isDeleted).length > 0 ? (
+                      {history.filter(item => !item.isDeleted && !item.isBookmarked).length > 0 ? (
                         <div className="space-y-2.5 divide-y divide-slate-100 max-h-72 overflow-y-auto pr-1">
-                          {history.filter(item => !item.isDeleted).map((hist) => (
+                          {history.filter(item => !item.isDeleted && !item.isBookmarked).map((hist) => (
                             <div 
                               key={hist.id} 
                               className="pt-2.5 first:pt-0 pb-1.5 flex items-start justify-between gap-2 border-b border-dashed border-slate-100 last:border-0 group cursor-pointer"
@@ -2749,8 +2976,8 @@ export default function App() {
 
                         <p className="text-[10.5px] text-slate-600 leading-relaxed md:text-[11px] font-sans">
                           {user ? (
-                            googleDriveToken ? (
-                              "Google Drive Sync မုဒ် (၁၀၀% Free & Unlimited) ကို အသုံးပြုနေပါသည်။ သင်၏ စာမှတ်များနှင့် ဘာသာပြန်မှတ်တမ်းများကို သင့်ကိုယ်ပိုင် Google Drive ပေါ်ရှိ 'dictionary_sync_backup.json' ဖိုင်တွင် သီးသန့် အလိုအလျောက် သိမ်းဆည်းပေးနေပါပြီ။"
+                            googleDriveAuthorized ? (
+                              "Google Drive & Cloud Sync စနစ် အမြဲတမ်းအွန်လိုင်း (Always On) ချိတ်ဆက်ထားပြီး ဖြစ်ပါသည်။ သင်၏ စာမှတ်များနှင့် ဘာသာပြန်မှတ်တမ်းများကို ခြေရာခံသိမ်းဆည်းပေးနေပါပြီ။ သင့်ကိုယ်ပိုင် Google Drive နှင့် အကျုံးဝင်သော တိမ်တိုက်ဒေတာစင်တာသို့ အလိုအလျောက် နောက်ကွယ်မှ အမြဲတမ်း မပြတ်စင့်ခ်လုပ် စာရင်းသွင်းပေးနေပါမည်။"
                             ) : (
                               "Google အကောင့်ဖြင့် ချိတ်ဆက်ထားသော်လည်း Google Drive Sync လုပ်နိုင်ရန် ခွင့်ပြုချက် (Authorize) ပြန်လုပ်ပေးရန် လိုအပ်ပါသည်။ အောက်ပါ 'Google Drive နှင့် ချိတ်ဆက်မည်' ခလုတ်ကို နှိပ်ပေးပါ။"
                             )
@@ -2787,7 +3014,7 @@ export default function App() {
                                   onClick={async () => {
                                     try {
                                       await signOut(auth);
-                                      updateGoogleDriveToken(null);
+                                      updateGoogleDriveToken(null, true);
                                       showSuccess("Google Account မှ ထွက်လိုက်ပါပြီ။");
                                     } catch (err: any) {
                                       console.error(err);
@@ -2799,7 +3026,7 @@ export default function App() {
                                 </button>
                               </div>
 
-                              {!googleDriveToken && (
+                              {!googleDriveAuthorized ? (
                                 <button
                                   type="button"
                                   onClick={async () => {
@@ -2822,7 +3049,30 @@ export default function App() {
                                   <CloudLightning className="w-4 h-4" />
                                   Google Drive ခွင့်ပြုချက် ပေးမည် (Authorize Google Drive)
                                 </button>
-                              )}
+                              ) : !googleDriveToken ? (
+                                <button
+                                  type="button"
+                                  onClick={async () => {
+                                    try {
+                                      const res = await signInWithPopup(auth, googleProvider);
+                                      const credential = GoogleAuthProvider.credentialFromResult(res);
+                                      if (credential?.accessToken) {
+                                        updateGoogleDriveToken(credential.accessToken);
+                                        showSuccess("Google Drive ချိတ်ဆက်မှု အောင်မြင်စွာ အသစ်ပြန်ညှိပြီးပါပြီ။");
+                                      } else {
+                                        throw new Error("Failed to get token.");
+                                      }
+                                    } catch (err: any) {
+                                      console.error(err);
+                                      alert("ချိတ်ဆက်ခွင့်ဇယားကို ပြန်ညှိရန် ပျက်ကွက်ခဲ့ပါသည်။");
+                                    }
+                                  }}
+                                  className="w-full py-1.5 px-3 rounded bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 text-[9.5px] font-bold cursor-pointer transition-all flex items-center justify-center gap-1.5"
+                                >
+                                  <RefreshCw className="w-3.5 h-3.5" />
+                                  Google Drive ချိတ်ဆက်ခွင့်သက်တမ်း ပြန်လည်အသစ်ပြုပြင်မည် (Refresh Connection)
+                                </button>
+                              ) : null}
 
                               {googleDriveToken && (
                                 <div className="space-y-2 pt-2.5 border-t border-dashed border-indigo-100">
@@ -2873,7 +3123,9 @@ export default function App() {
                                           const merged = mergeHistory(history, restored);
                                           setHistory(merged);
                                           await saveHistoryToIndexedDB(merged);
-                                          showSuccess(`Google Drive Backup မှ သမိုင်းနှင့် စာမှတ်မူရင်းဒေတာ ${restored.length} ခုကို အောင်မြင်စွာ ပြန်လည် ဆွဲယူရယူပြီးပါပြီ။`);
+                                          const numRestoredBk = restored.filter((i: any) => i.isBookmarked).length;
+                                          const numRestoredHist = restored.filter((i: any) => !i.isBookmarked).length;
+                                          showSuccess(`Google Drive Backup မှ စာမှတ် (Bookmark) ${numRestoredBk} ခုနှင့် သမိုင်းရှာဖွေမှုမှတ်တမ်း (History) ${numRestoredHist} ခုကို အောင်မြင်စွာ ပြန်လည် ဆွဲယူတင်သွင်းပြီးပါပြီ။`);
                                           
                                           // Push restored/resurrected state back to Google Drive right away
                                           await handleSaveToCloudDirectly(merged);
@@ -3011,6 +3263,29 @@ export default function App() {
                             <span>Backup ပြန်သွင်းရန် (Import)</span>
                           </button>
                         </div>
+                      </div>
+
+                      {/* Full Wipe & Reset System (User Request) */}
+                      <div className="bg-rose-50/50 border border-rose-100 p-4 rounded-xl space-y-3 shadow-3xs mt-4">
+                        <div className="flex items-center justify-between">
+                          <h4 className="text-xs font-bold text-rose-850 flex items-center gap-1.5 uppercase tracking-wide">
+                            <Trash2 className="w-4 h-4 text-rose-600 animate-pulse shrink-0" />
+                            ဒေတာအားလုံးနှင့် Cloud Backups များကို အပြီးတိုင်ဖျက်သိမ်းခြင်း (Full System Clean Reset)
+                          </h4>
+                        </div>
+                        <p className="text-[10.5px] text-slate-555 leading-relaxed font-sans">
+                          သင့်စက်ရှိ မှတ်တမ်း၊ စာမှတ် (Bookmarks) အားလုံးအပြင် <b>Google Drive backup ဖိုင်နှင့် ဆာဗာ Cloud Sync ဒေတာ</b> များအားလုံးကို လုံးဝအပြီးအပိုင် (၁၀၀% အပြောင်) တိုက်ဖျက်ရှင်းလင်းပစ်ပြီး အက်ပ်ကို အသစ်စက်စက်အနေအထားအတိုင်း ပြန်လည်စတင်အသုံးပြုနိုင်ရန် ဖန်တီးပေးပါမည်။ <span className="text-rose-600 font-bold">(သတိပြုရန်: ပြန်လည်ရယူ၍ မရနိုင်တော့ပါ။)</span>
+                        </p>
+                        <button
+                          type="button"
+                          disabled={isWiping}
+                          onClick={handleWipeAllDataAndCloud}
+                          className="w-full flex items-center justify-center gap-1.5 text-[11px] font-bold bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white py-2.5 px-3 rounded-lg shadow-xs cursor-pointer active:scale-95 transition-all text-center font-sans"
+                          title="ဤစက်တွင်းဒေတာများနှင့် Cloud ပေါ်ရှိ Backup များကိုပါ တစ်ပါတည်း ရှင်းလင်းဖျက်ဆီးပါမည်"
+                        >
+                          <Trash2 className="w-3.5 h-3.5 text-white shrink-0" />
+                          <span>{isWiping ? "ရှင်းလင်းနေပါသည်..." : "ဒေတာအားလုံး အပြီးအပိုင် ရှင်းလင်းမည် (Full Wipe & Fresh Start)"}</span>
+                        </button>
                       </div>
                     </motion.div>
                   )}</AnimatePresence>
