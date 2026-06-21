@@ -36,3 +36,20 @@ export interface HistoryItem {
     dictionary_definition?: string | null;
   }[];
 }
+
+export interface BookmarkedWord {
+  id: string;
+  original: string;
+  base: string;
+  pos: string;
+  definition: string;
+  timestamp: number;
+}
+
+export interface StudyNote {
+  id: string;
+  title: string;
+  content: string;
+  timestamp: number;
+}
+
